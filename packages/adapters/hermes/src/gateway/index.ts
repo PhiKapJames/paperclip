@@ -41,6 +41,9 @@ Optional fields:
 - paperclipApiUrl (string): Paperclip API URL reachable from the Hermes host. This is not a credential.
 - sessionKeyStrategy (issue | agent | run | none): defaults to issue.
 - timeoutSec (number): defaults to 600.
+- headlessApprovalPolicy (deny | bridge): defaults to deny. What to do when Hermes emits an approval.request event. deny posts choice=deny immediately and ends the run with hermes_gateway_approval_timeout. bridge posts an approval card on the Paperclip issue and waits for a human; the card is never answered by the adapter itself.
+- approvalTimeoutSec (number): defaults to 300, clamped to 15...3600. With bridge, how long to wait for the human answer before denying. Set it to the approval timeout the Hermes server is configured with (about 300s by default); Paperclip cannot read that Hermes-side setting. Always cut short before timeoutSec, and timeoutSec remains the hard wall for the whole run.
+- The approval wait is part of timeoutSec, not additional to it: the human gets min(approvalTimeoutSec, time left in the run - 10s). Interactive runs normally need timeoutSec raised well above the 600 default, with approvalTimeoutSec raised in step and kept comfortably below timeoutSec so the approved work still has time to run.
 - eventReconnectMs (number): defaults to 2000.
 - instructions (string): stable Hermes instructions sent separately from wake input.
 
@@ -49,6 +52,7 @@ Runtime mapping:
 - Sends Idempotency-Key equal to the Paperclip run id for correlation only; Hermes v0.16.0 did not dedupe duplicate creates.
 - Streams GET /v1/runs/{run_id}/events and polls GET /v1/runs/{run_id} as fallback.
 - Calls POST /v1/runs/{run_id}/stop on timeout.
+- With headlessApprovalPolicy=bridge, answers POST /v1/runs/{run_id}/approval with the human's exact choice and request_id; an unanswered, cancelled, superseded or unparseable approval is always denied. Command text is redacted before it reaches the issue card or the logs.
 
 Security guidance:
 - Prefer HTTPS or a private overlay network for non-loopback hosts.
@@ -64,7 +68,9 @@ export function createServerAdapter(): ServerAdapterModule {
     sessionCodec,
     sessionManagement,
     models,
-    supportsLocalAgentJwt: false,
+    // The headlessApprovalPolicy=bridge escalation posts an issue-thread interaction,
+    // so this adapter needs the injected run JWT. It never reads the Hermes gateway's own credentials.
+    supportsLocalAgentJwt: true,
     supportsInstructionsBundle: false,
     requiresMaterializedRuntimeSkills: false,
     agentConfigurationDoc,

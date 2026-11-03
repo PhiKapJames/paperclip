@@ -1,5 +1,9 @@
 import type { AdapterConfigSchema } from "@paperclipai/adapter-utils";
-import { DEFAULT_EVENT_RECONNECT_MS, DEFAULT_TIMEOUT_SEC } from "../shared/constants.js";
+import {
+  DEFAULT_APPROVAL_TIMEOUT_SEC,
+  DEFAULT_EVENT_RECONNECT_MS,
+  DEFAULT_TIMEOUT_SEC,
+} from "../shared/constants.js";
 import { INSECURE_REMOTE_HTTP_ESCAPE_HATCH } from "./transport-security.js";
 
 export function getConfigSchema(): AdapterConfigSchema {
@@ -45,6 +49,24 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Timeout seconds",
         type: "number",
         default: DEFAULT_TIMEOUT_SEC,
+      },
+      {
+        key: "headlessApprovalPolicy",
+        label: "Hermes approval policy",
+        type: "select",
+        default: "deny",
+        options: [
+          { value: "deny", label: "Deny (fail the run)" },
+          { value: "bridge", label: "Ask a human on the issue" },
+        ],
+        hint: "What to do when Hermes asks for command approval. deny refuses immediately (default); bridge posts an approval card on the issue and forwards the human's answer. Never auto-approves.",
+      },
+      {
+        key: "approvalTimeoutSec",
+        label: "Approval timeout seconds",
+        type: "number",
+        default: DEFAULT_APPROVAL_TIMEOUT_SEC,
+        hint: "With the bridge policy, how long to wait for the human answer before denying. Clamped to 15...3600 and always cut short before the run timeout.",
       },
       {
         key: "eventReconnectMs",

@@ -1,7 +1,21 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
-import { execute, mapFinalResultForTest, parseSseFramesForTest, resolveSessionKey } from "./execute.js";
+import {
+  approvalChoiceIds,
+  buildApprovalInteractionBody,
+  createApprovalInteraction,
+  execute,
+  extractApprovalRequest,
+  extractPendingApproval,
+  hermesApprovalKey,
+  postApproval,
+  resolveHermesApprovalChoice,
+  type HermesApprovalChoice,
+  mapFinalResultForTest,
+  parseSseFramesForTest,
+  resolveSessionKey,
+} from "./execute.js";
 import { testEnvironment } from "./test.js";
 
 function makeCtx(config: Record<string, unknown>): AdapterExecutionContext {
@@ -77,6 +91,351 @@ describe("parseSseFramesForTest", () => {
     const parsed = parseSseFramesForTest("event: message.delta\ndata: {\"delta\":\"hi\"}\n\n:data\ndata: later");
     expect(parsed.frames).toEqual([{ event: "message.delta", data: "{\"delta\":\"hi\"}" }]);
     expect(parsed.rest).toBe(":data\ndata: later");
+  });
+});
+
+describe("extractApprovalRequest", () => {
+  const cases: Array<[string, unknown, string | null]> = [
+    ["canonical approval.request frame", {
+      event: "approval.request",
+      data: { request_id: "req-1", command: "rm -rf /tmp/x", reason: "destructive" },
+    }, "req-1"],
+    ["camelCase request id", { event: "approval.request", data: { requestId: "req-2" } }, "req-2"],
+    ["nested under data.data", { event: "approval.request", data: { data: { request_id: "req-3" } } }, "req-3"],
+    ["nested under payload", { event: "approval.request", data: { payload: { request_id: "req-4" } } }, "req-4"],
+    ["event name carried in the payload", {
+      data: { event: "approval.request", request_id: "req-5" },
+    }, "req-5"],
+    ["missing request id", { event: "approval.request", data: { command: "ls" } }, null],
+    ["a non-approval event", { event: "token", data: { text: "hi" } }, null],
+    ["blank request id", { event: "approval.request", data: { request_id: "   " } }, null],
+  ]
+
+  it.each(cases)("reads %s", (_name, frame, expected) => {
+    const result = extractApprovalRequest(frame)
+    if (expected === null) {
+      expect(result).toBeNull()
+      return
+    }
+    expect(result?.requestId).toBe(expected)
+  })
+
+  it("carries the command and reason for the human-facing card", () => {
+    expect(extractApprovalRequest({
+      event: "approval.request",
+      data: { request_id: "req-9", command: "DROP TABLE users", reason: "irreversible" },
+    })).toEqual({
+      requestId: "req-9",
+      command: "DROP TABLE users",
+      reason: "irreversible",
+      allowed: ["once", "deny"],
+    })
+  })
+
+  it("leaves command and reason null when Hermes omits them", () => {
+    expect(extractApprovalRequest({ event: "approval.request", data: { request_id: "req-10" } }))
+      .toEqual({ requestId: "req-10", command: null, reason: null, allowed: ["once", "deny"] })
+  })
+
+  it("keeps only the choices the request advertises", () => {
+    expect(extractApprovalRequest({
+      event: "approval.request",
+      data: { request_id: "req-11", allowed_choices: ["once", "session", "always", "deny"] },
+    })?.allowed).toEqual(["once", "session", "always", "deny"])
+  })
+})
+
+describe("approvalChoiceIds", () => {
+  const cases: Array<[string, unknown, HermesApprovalChoice[]]> = [
+    ["no advertisement", undefined, ["once", "deny"]],
+    ["a non-list advertisement", "once", ["once", "deny"]],
+    ["a list of junk", [1, null, "nope"], ["once", "deny"]],
+    ["an empty list", [], ["once", "deny"]],
+    ["deny only", ["deny"], ["once", "deny"]],
+    ["an advertised subset", ["once", "session", "deny"], ["once", "session", "deny"]],
+    ["all four", ["once", "session", "always", "deny"], ["once", "session", "always", "deny"]],
+  ]
+
+  it.each(cases)("advertised %s offers %j", (_name, advertised, expected) => {
+    expect(approvalChoiceIds(advertised)).toEqual(expected)
+  })
+
+  it("never drops deny", () => {
+    expect(approvalChoiceIds(["once", "always"])).toEqual(["once", "always", "deny"])
+  })
+})
+
+describe("extractPendingApproval", () => {
+  const cases: Array<[string, unknown, string | null]> = [
+    ["top-level request_id", { status: "waiting_for_approval", request_id: "req-1" }, "req-1"],
+    ["camelCase", { status: "waiting_for_approval", requestId: "req-2" }, "req-2"],
+    ["nested under approvals", { approvals: { pending: [{ request_id: "req-3" }] } }, "req-3"],
+    ["nested under data", { data: { status: "waiting_for_approval", request_id: "req-4" } }, "req-4"],
+    ["a run that is not waiting", { status: "completed", output: "done" }, null],
+    ["waiting but no request id exposed", { status: "waiting_for_approval" }, null],
+  ]
+
+  it.each(cases)("reads %s", (_name, record, expected) => {
+    const result = extractPendingApproval(record)
+    if (expected === null) {
+      expect(result).toBeNull()
+      return
+    }
+    expect(result?.requestId).toBe(expected)
+  })
+})
+
+describe("resolveHermesApprovalChoice", () => {
+  const answered = (answers: unknown, result: Record<string, unknown> = {}) => ({
+    status: "answered",
+    result: { version: 1, answers, ...result },
+  })
+
+  const cases: Array<[string, unknown, HermesApprovalChoice]> = [
+    ["once", answered([{ questionId: "decision", optionIds: ["once"] }]), "once"],
+    ["session", answered([{ questionId: "decision", optionIds: ["session"] }]), "session"],
+    ["always", answered([{ questionId: "decision", optionIds: ["always"] }]), "always"],
+    ["deny", answered([{ questionId: "decision", optionIds: ["deny"] }]), "deny"],
+    ["the record-shaped answer map", answered({ decision: { selectedOptionIds: ["session"] } }), "session"],
+    ["an unknown option id", answered([{ questionId: "decision", optionIds: ["maybe"] }]), "deny"],
+    ["two selected options", answered([{ questionId: "decision", optionIds: ["once", "always"] }]), "deny"],
+    ["an empty selection", answered([{ questionId: "decision", optionIds: [] }]), "deny"],
+    ["free text instead of an option", answered([{ questionId: "decision", optionIds: [], otherText: "go ahead" }]), "deny"],
+    ["free text alongside an option", answered([{ questionId: "decision", optionIds: ["once"], otherText: "but carefully" }]), "deny"],
+    ["an answer for another question", answered([{ questionId: "other", optionIds: ["once"] }]), "deny"],
+    ["no answers", answered([]), "deny"],
+    ["a cancelled answer", answered([{ questionId: "decision", optionIds: ["once"] }], { cancelled: true }), "deny"],
+    ["a superseded question", answered([{ questionId: "decision", optionIds: ["once"] }], { expirationReason: "superseded_by_comment" }), "deny"],
+    ["still pending", { status: "pending", result: null }, "deny"],
+    ["cancelled", { status: "cancelled", result: {} }, "deny"],
+    ["expired", { status: "expired", result: {} }, "deny"],
+    ["rejected", { status: "rejected", result: {} }, "deny"],
+    ["failed", { status: "failed", result: {} }, "deny"],
+    ["answered with no result", { status: "answered", result: null }, "deny"],
+    ["a malformed answer entry", answered([{ questionId: "decision", optionIds: "once" }]), "deny"],
+    ["answers is not a container", "yes", "deny"],
+    ["null", null, "deny"],
+  ]
+
+  it.each(cases)("maps %s to the safe choice", (_name, interaction, expected) => {
+    expect(resolveHermesApprovalChoice(interaction)).toBe(expected)
+  })
+})
+
+describe("hermesApprovalKey", () => {
+  it("namespaces the run and approval request ids", () => {
+    expect(hermesApprovalKey("pc-run-1", "apr-1")).toBe("hermes-approval:pc-run-1:apr-1")
+  })
+
+  it("refuses a key longer than the interaction validator allows rather than truncating it", () => {
+    expect(hermesApprovalKey("r".repeat(250), "apr-1")).toBeNull()
+  })
+
+  it("accepts a key of exactly the 255-char limit", () => {
+    const prefix = "hermes-approval:"
+    const runId = "r".repeat(255 - prefix.length - 1 - 1)
+    expect(hermesApprovalKey(runId, "a")).toHaveLength(255)
+    expect(hermesApprovalKey(runId, "a")).not.toBeNull()
+  })
+})
+
+describe("buildApprovalInteractionBody", () => {
+  it("asks one single-choice question carrying only once/deny by default", () => {
+    const body = buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command: "apt-get install -y curl",
+      reason: "needs a download tool",
+    }) as {
+      kind: string;
+      idempotencyKey: string;
+      title: string;
+      summary: string;
+      resolverPolicy: string;
+      continuationPolicy: string;
+      payload: {
+        version: number;
+        supersedeOnUserComment: boolean;
+        runtimeRequestId: string;
+        questions: Array<Record<string, any>>;
+      };
+    };
+    expect(body.kind).toBe("ask_user_questions");
+    expect(body.idempotencyKey).toBe("hermes-approval:run_7:req-1");
+    // Must be answered by a human, and answering must not wake a second agent run.
+    expect(body.resolverPolicy).toBe("human_only");
+    expect(body.continuationPolicy).toBe("none");
+    expect(body.payload.supersedeOnUserComment).toBe(false);
+    expect(body.payload.version).toBe(1);
+    expect(body.payload.runtimeRequestId).toBe("req-1");
+    expect(body.payload.questions).toHaveLength(1);
+    const question = body.payload.questions[0];
+    expect(question.selectionMode).toBe("single");
+    expect(question.id).toBe("decision");
+    expect(question.allowOther).toBe(false);
+    expect((question.options as Array<Record<string, any>>).map((o) => o.id)).toEqual([
+      "once",
+      "deny",
+    ]);
+    expect(body.summary).toContain("apt-get install -y curl");
+    expect(body.summary).toContain("needs a download tool");
+    expect(body.payload.questions[0].prompt).toContain("apt-get install -y curl");
+  });
+
+  it("offers the pattern choices Hermes advertises on the request", () => {
+    const body = buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command: "kubectl delete pod web-1",
+      reason: null,
+      allowed: ["once", "session", "always", "deny"],
+    }) as { payload: { questions: Array<{ options: Array<Record<string, any>> }> } };
+    const options = body.payload.questions[0].options;
+    expect(options.map((o) => o.id)).toEqual(["once", "session", "always", "deny"]);
+    // Nothing may promise more than Hermes actually does.
+    expect(options.find((o) => o.id === "session")?.label).toBe("Allow for this run");
+    expect(options.find((o) => o.id === "session")?.description).toContain("this run");
+    expect(options.find((o) => o.id === "always")?.description).toContain("Hermes stores");
+  });
+
+  it("keeps a long or control-character command inside the server's field limits", () => {
+    // Limits from packages/shared ask_user_questions validators: title 240,
+    // summary 1000, question prompt 4000.
+    const body = buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command: `echo ${"a".repeat(20000)}\u001b[2J`,
+      reason: "r".repeat(20000),
+    }) as { title: string; summary: string; payload: { questions: Array<{ prompt: string }> } };
+    expect(body.title.length).toBeLessThanOrEqual(240);
+    expect(body.summary.length).toBeLessThanOrEqual(1000);
+    expect(body.payload.questions[0].prompt.length).toBeLessThanOrEqual(4000);
+    expect(body.summary).not.toContain("\u001b");
+  });
+
+  it("still asks something when Hermes sends no command or reason", () => {
+    const body = buildApprovalInteractionBody({ key: "k", requestId: "req-1", command: null, reason: null }) as {
+      summary: string;
+      payload: { questions: Array<{ prompt: string }> };
+    };
+    expect(body.summary).toContain("did not say");
+    expect(body.payload.questions[0].prompt.length).toBeGreaterThan(0);
+  });
+});
+
+describe("createApprovalInteraction", () => {
+  it("posts the card to the issue with the run-scoped agent token", async () => {
+    const calls: Array<{ url: string; init: any }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: any) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ interaction: { id: "itest_1" } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      });
+    }));
+    try {
+      const result = await createApprovalInteraction({
+        paperclipApiUrl: "http://localhost:3100/",
+        authToken: "local_agent_jwt",
+        runId: "run_7",
+        issueId: "iss_1",
+        body: { kind: "ask_user_questions" },
+        signal: new AbortController().signal,
+      });
+      expect(result.interactionId).toBe("itest_1");
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe("http://localhost:3100/api/issues/iss_1/interactions");
+      expect(calls[0].init.method).toBe("POST");
+      expect(calls[0].init.headers).toMatchObject({
+        Authorization: "Bearer local_agent_jwt",
+        "X-Paperclip-Run-Id": "run_7",
+      });
+      expect(JSON.parse(calls[0].init.body)).toEqual({ kind: "ask_user_questions" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("reports the status when Paperclip rejects the card", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: "forbidden" }), {
+      status: 403,
+      headers: { "Content-Type": "application/json" },
+    })));
+    try {
+      await expect(createApprovalInteraction({
+        paperclipApiUrl: "http://localhost:3100",
+        authToken: "bad_token",
+        runId: "run_7",
+        issueId: "iss_1",
+        body: { kind: "ask_user_questions" },
+        signal: new AbortController().signal,
+      })).rejects.toThrow(/403/);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("postApproval", () => {
+  const baseInput = {
+    baseUrl: new URL("http://127.0.0.1:8642"),
+    headers: {
+      Authorization: "Bearer hermes-key",
+    },
+    runId: "run_7",
+    key: "hermes-approval:run_7:req-1",
+    requestId: "req-1",
+    signal: new AbortController().signal,
+  };
+
+  async function runWith(status: number) {
+    const calls: Array<{ url: string; init: any }> = [];
+    const logs: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: any) => {
+      calls.push({ url, init });
+      return new Response(status === 409 ? JSON.stringify({ error: "already resolved" }) : "{}", {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+    }));
+    const onLog = vi.fn(async (_stream: "stdout" | "stderr", chunk: string) => {
+      logs.push(chunk);
+    });
+    try {
+      const delivered = await postApproval({
+        ...baseInput,
+        choice: "once",
+        onLog,
+      });
+      return { calls, logs, delivered };
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }
+
+  it("posts the exact board choice and request id to the run approval endpoint", async () => {
+    const { calls, delivered } = await runWith(200);
+    expect(delivered).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("http://127.0.0.1:8642/v1/runs/run_7/approval");
+    expect(calls[0].init.method).toBe("POST");
+    expect(JSON.parse(calls[0].init.body)).toEqual({ choice: "once", request_id: "req-1" });
+    // The answer must be idempotent on Hermes' side too, so a retry cannot
+    // answer a later request under the same key.
+    expect(calls[0].init.headers["Idempotency-Key"]).toBe("hermes-approval:run_7:req-1");
+  });
+
+  it("treats a 409 already-resolved answer as delivered and never retries", async () => {
+    const { calls, logs, delivered } = await runWith(409);
+    expect(delivered).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(logs.join("")).toContain("already resolved");
+  });
+
+  it("reports an undelivered answer without throwing so the SSE stream survives", async () => {
+    const { logs, delivered } = await runWith(500);
+    expect(delivered).toBe(false);
+    expect(logs.join("")).toContain("HTTP 500");
   });
 });
 
@@ -1105,5 +1464,286 @@ describe("mapFinalResultForTest", () => {
     expect(result.exitCode).toBe(1);
     expect(result.errorCode).toBe("hermes_gateway_run_failed");
     expect(result.errorMessage).toBe("boom");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Human-in-the-loop approval bridge (hermes_gateway).
+//
+// Two HTTP surfaces are faked here: the Hermes gateway (run create, SSE,
+// POST /v1/runs/{id}/approval) and the Paperclip control plane (the issue-thread
+// interaction the human answers). Every case asserts the exact choice forwarded to
+// Hermes, because the whole point of the bridge is that a human decides.
+// ---------------------------------------------------------------------------
+
+const APPROVAL_REQUEST_EVENT = [
+  "event: approval.request",
+  "data: " + JSON.stringify({
+    request_id: "approval-1",
+    command: "rm -rf /var/tmp/scratch",
+    reason: "Deleting the scratch directory",
+  }),
+  "",
+];
+
+function approvalAnswer(interactionId: string, optionIds: string[]) {
+  return {
+    interactions: [{
+      id: interactionId,
+      idempotencyKey: hermesApprovalKey("pc-run-1", "approval-1"),
+      kind: "ask_user_questions",
+      status: "answered",
+      result: { version: 1, answers: [{ questionId: "decision", optionIds }] },
+    }],
+  };
+}
+
+const PENDING_INTERACTION = { interactions: [{ id: "int-1", kind: "ask_user_questions", status: "pending" }] };
+
+/**
+ * Fetch fake for the approval bridge. `interactions` is what the Paperclip poll returns on
+ * each read, so a test can hold a card open and then answer it.
+ */
+function stubApprovalFetch(options: {
+  interactions?: () => unknown;
+  approvalStatus?: number;
+  events?: string[];
+}) {
+  const approvals: Array<Record<string, unknown>> = [];
+  const createdInteractions: Array<Record<string, unknown>> = [];
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const method = (init?.method ?? "GET").toUpperCase();
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) : null;
+    if (method === "POST" && url.endsWith("/v1/runs")) {
+      return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started" }), { status: 200 });
+    }
+    if (method === "POST" && url.endsWith("/interactions")) {
+      createdInteractions.push({ url, headers: { ...(init?.headers as Record<string, string>) }, body });
+      return new Response(JSON.stringify({ interaction: { id: "int-1" } }), { status: 201 });
+    }
+    if (method === "GET" && url.includes("/interactions")) {
+      return new Response(JSON.stringify(options.interactions ? options.interactions() : PENDING_INTERACTION), { status: 200 });
+    }
+    if (method === "POST" && url.endsWith("/approval")) {
+      approvals.push({ url, headers: { ...(init?.headers as Record<string, string>) }, body });
+      return new Response(JSON.stringify({}), { status: options.approvalStatus ?? 200 });
+    }
+    if (url.endsWith("/events")) {
+      return new Response(sseStream((options.events ?? []).join("\n")), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return { fetchMock, approvals, createdInteractions };
+}
+
+function makeApprovalCtx(config: Record<string, unknown>): AdapterExecutionContext {
+  const ctx = makeCtx({
+    apiBaseUrl: "http://127.0.0.1:8642",
+    apiKey: "secret-key",
+    timeoutSec: 60,
+    paperclipApiUrl: "http://localhost:3100",
+    ...config,
+  });
+  ctx.authToken = "local-agent-jwt";
+  return ctx;
+}
+
+describe("hermes_gateway approval bridge", () => {
+  it("posts the card and forwards the human approve choice to Hermes", async () => {
+    let polls = 0;
+    const stub = stubApprovalFetch({
+      interactions: () => {
+        polls += 1;
+        return polls < 2 ? PENDING_INTERACTION : approvalAnswer("int-1", ["once"]);
+      },
+      events: [...APPROVAL_REQUEST_EVENT, "event: run.completed", 'data: {"status":"completed","output":"done"}', ""],
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("done");
+
+    expect(stub.createdInteractions).toHaveLength(1);
+    const card = stub.createdInteractions[0];
+    expect(card.url).toBe("http://localhost:3100/api/issues/issue-1/interactions");
+    expect(card.headers).toMatchObject({
+      Authorization: "Bearer local-agent-jwt",
+      "X-Paperclip-Run-Id": "pc-run-1",
+    });
+    const cardBody = card.body as Record<string, any>;
+    expect(cardBody).toMatchObject({
+      kind: "ask_user_questions",
+      idempotencyKey: hermesApprovalKey("pc-run-1", "approval-1"),
+      resolverPolicy: "human_only",
+      continuationPolicy: "none",
+    });
+    // The request advertises no choice list, so only the always-valid choices appear.
+    expect(cardBody.payload.questions[0].options.map((option: { id: string }) => option.id))
+      .toEqual(["once", "deny"]);
+    expect(cardBody.payload.questions[0].prompt).toContain("Deleting the scratch directory");
+
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.approvals[0]).toMatchObject({
+      url: "http://127.0.0.1:8642/v1/runs/run-hermes-1/approval",
+      body: { choice: "once", request_id: "approval-1" },
+    });
+  });
+
+  it("offers and forwards the pattern choices a request advertises", async () => {
+    const stub = stubApprovalFetch({
+      interactions: () => approvalAnswer("int-1", ["session"]),
+      events: [
+        "event: approval.request",
+        "data: " + JSON.stringify({
+          request_id: "approval-1",
+          command: "rm -rf /var/tmp/scratch",
+          reason: "Deleting the scratch directory",
+          allowed_choices: ["once", "session", "always", "deny"],
+        }),
+        "",
+        "event: run.completed",
+        'data: {"status":"completed","output":"done"}',
+        "",
+      ],
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+
+    expect(result.exitCode).toBe(0);
+    const cardBody = stub.createdInteractions[0].body as Record<string, any>;
+    expect(cardBody.payload.questions[0].options.map((option: { id: string }) => option.id))
+      .toEqual(["once", "session", "always", "deny"]);
+    expect(stub.approvals[0]).toMatchObject({
+      body: { choice: "session", request_id: "approval-1" },
+    });
+  });
+
+  it("forwards a human deny and fails the run without a connection failure", async () => {
+    const stub = stubApprovalFetch({
+      interactions: () => approvalAnswer("int-1", ["deny"]),
+      events: [...APPROVAL_REQUEST_EVENT, "event: run.completed", 'data: {"status":"completed","output":"done"}', ""],
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.approvals[0]).toMatchObject({ body: { choice: "deny", request_id: "approval-1" } });
+    // Hermes ends the run itself once it is denied; the adapter reports that failure,
+    // not a gateway outage.
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("done");
+  });
+
+  it("defaults to deny: no card is raised and Hermes is refused at once", async () => {
+    const stub = stubApprovalFetch({ events: APPROVAL_REQUEST_EVENT });
+
+    const result = await execute(makeApprovalCtx({}));
+
+    expect(stub.createdInteractions).toHaveLength(0);
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.approvals[0]).toMatchObject({ body: { choice: "deny", request_id: "approval-1" } });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_approval_timeout");
+  });
+
+  it("fails closed when bridge is configured without a run access token", async () => {
+    const stub = stubApprovalFetch({ events: APPROVAL_REQUEST_EVENT });
+    const ctx = makeApprovalCtx({ headlessApprovalPolicy: "bridge" });
+    delete ctx.authToken;
+
+    const result = await execute(ctx);
+
+    // Without the injected run JWT the card could never be authorized, so nothing is
+    // posted and Hermes is refused rather than left waiting.
+    expect(stub.createdInteractions).toHaveLength(0);
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.approvals[0]).toMatchObject({ body: { choice: "deny", request_id: "approval-1" } });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_approval_unconfigured");
+  });
+
+  it("treats a 409 approval answer as already resolved and keeps streaming", async () => {
+    const stub = stubApprovalFetch({
+      interactions: () => approvalAnswer("int-1", ["once"]),
+      approvalStatus: 409,
+      events: [...APPROVAL_REQUEST_EVENT, "event: run.completed", 'data: {"status":"completed","output":"done"}', ""],
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+
+    expect(stub.approvals).toHaveLength(1);
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("done");
+  });
+
+  it("refuses without waiting when the run has no approval budget left", async () => {
+    let polls = 0;
+    const stub = stubApprovalFetch({
+      interactions: () => {
+        polls += 1;
+        return { interactions: [{ id: "int-1", idempotencyKey: hermesApprovalKey("pc-run-1", "approval-1"), status: "pending" }] };
+      },
+      events: APPROVAL_REQUEST_EVENT,
+    });
+
+    // A 3-second run cannot wait for a human, so the bridge denies on the spot.
+    const started = Date.now();
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge", timeoutSec: 3 }));
+
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(polls).toBe(1);
+    expect(stub.createdInteractions).toHaveLength(1);
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.approvals[0]).toMatchObject({ body: { choice: "deny", request_id: "approval-1" } });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_approval_timeout");
+  });
+
+  it("recovers a pending approval from the run status when SSE never replayed it", async () => {
+    const stub = stubApprovalFetch({ events: [] });
+    let statusReads = 0;
+    const baseFetch = stub.fetchMock;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs/run-hermes-1")) {
+        statusReads += 1;
+        return new Response(JSON.stringify({
+          status: "awaiting_approval",
+          pending_approval: { request_id: "approval-1", command: "rm -rf /var/tmp/scratch" },
+        }), { status: 200 });
+      }
+      return baseFetch(input as never, init as never);
+    }));
+
+    const result = await execute(makeApprovalCtx({ pollIntervalMs: 250 }));
+
+    expect(statusReads).toBeGreaterThan(0);
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.approvals[0]).toMatchObject({ body: { choice: "deny", request_id: "approval-1" } });
+    expect(result.errorCode).toBe("hermes_gateway_approval_timeout");
+  });
+
+  it("never logs the Hermes API key while bridging", async () => {
+    const stub = stubApprovalFetch({
+      interactions: () => approvalAnswer("int-1", ["once"]),
+      events: [...APPROVAL_REQUEST_EVENT, "event: run.completed", 'data: {"status":"completed","output":"done"}', ""],
+    });
+    const ctx = makeApprovalCtx({ headlessApprovalPolicy: "bridge" });
+    const logged: string[] = [];
+    ctx.onLog = vi.fn(async (stream: string, chunk: string) => {
+      logged.push(chunk);
+    });
+
+    await execute(ctx);
+
+    expect(logged.join("")).not.toContain("secret-key");
+    expect(logged.join("")).toContain("hermes-gateway:approval");
+    expect(stub.approvals).toHaveLength(1);
   });
 });

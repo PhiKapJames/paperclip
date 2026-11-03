@@ -168,6 +168,62 @@ secret values, so do not copy printed tokens into comments or config. Use
 multiline comments or status updates, preserve newlines with a heredoc plus
 `jq --arg`.
 
+### Gateway command approvals
+
+When a guarded command needs consent, the Hermes gateway emits an
+`approval.request` event and waits for
+`POST /v1/runs/{run_id}/approval`. A Paperclip wake has no terminal to answer
+on, so `headlessApprovalPolicy` decides what happens:
+
+- `deny` (default): the adapter answers `choice: "deny"` immediately and ends
+  the run with `hermes_gateway_approval_timeout`. Nothing hangs, and nothing is
+  ever approved without a human saying so.
+- `bridge`: the adapter posts an approval card on the Paperclip issue (an
+  `ask_user_questions` interaction, rendered by the normal issue-thread card)
+  and waits for the human. The card asks one single-choice question and forwards
+  the chosen id verbatim as `{ "choice": ..., "request_id": ... }`. It offers
+  **Allow once** and **Deny** — the two choices every Hermes approval accepts —
+  plus **Allow for this run** and **Always allow** only when the
+  `approval.request` advertises them (an `allowed_choices` list). Nothing on the
+  card promises more than Hermes does: `session` only claims the current run may
+  stop re-asking, and `always` only says Hermes stores the pattern. The card is
+  `human_only`, so the
+  adapter can never answer it, and `continuationPolicy: "none"` means answering
+  does not wake a second run — the run that is already waiting picks it up.
+
+Failure is always a deny: an unanswered, expired, cancelled, superseded or
+unparseable answer resolves to `deny`, and a bridge that cannot post or read the
+card fails the run instead of silently approving. Codes:
+`hermes_gateway_approval_timeout` (nobody answered, or the default deny policy),
+`hermes_gateway_approval_unconfigured` (`bridge` without a Paperclip API URL, a
+run access token, or an issue), `hermes_gateway_approval_bridge_failed` (Paperclip
+rejected the interaction), `hermes_gateway_approval_unparseable` (Hermes asked
+without a usable `request_id`).
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `headlessApprovalPolicy` | `deny` | `deny` or `bridge`. Never auto-approves. |
+| `approvalTimeoutSec` | `300` | How long `bridge` waits for the human. Clamped to `15`…`3600`. |
+| `timeoutSec` | `600` | Hard wall for the whole run, approval wait included. |
+
+`timeoutSec` is the hard wall: the human gets
+`min(approvalTimeoutSec, time left in the run - 10s)`, and the adapter always
+denies before `timeoutSec` fires so a run never dies with a request still
+pending on the Hermes side. Interactive gateway runs routinely run far longer
+than the 600-second default, so raising `timeoutSec` well above it (and
+`approvalTimeoutSec` with it) is the normal operator setup. Keep
+`timeoutSec > approvalTimeoutSec` with room for the work that follows the
+approval — an approval budget nearly as large as the run budget leaves the
+human much less real time than the number suggests, because the wait is part of
+the run, not additional to it.
+
+All three fields are per-agent `hermes_gateway` configuration and none of them
+is sent to Hermes, so `approvalTimeoutSec` has to be set to the approval timeout
+the Hermes server itself is configured with (its own default is about 300s, but
+that is a Hermes-side setting Paperclip cannot read). Command text reaching the
+issue card and the run log is redacted, and the Hermes `apiKey` is never sent to
+Paperclip.
+
 ### Hermes-originated Paperclip tasks
 
 The package includes a Hermes skill/helper for the reverse direction: a user

@@ -97,4 +97,20 @@ describe("parseHermesGatewayStdoutLine — regression guards for unrelated handl
     expect(result).toHaveLength(1);
     expect(result[0]).toEqual({ kind: "stdout", ts: TS, text: "just a plain line of output" });
   });
+
+  it("renders the approval bridge line as a system message without the brackets", () => {
+    const result = parseHermesGatewayStdoutLine(
+      "[hermes-gateway:approval run=run-1 request=approval-1 waiting for a human decision]",
+      TS,
+    );
+    expect(result).toEqual([{ kind: "system", ts: TS, text: "Hermes approval: run=run-1 request=approval-1 waiting for a human decision" }]);
+  });
+
+  it("renders the approval decision line", () => {
+    const result = parseHermesGatewayStdoutLine(
+      "[hermes-gateway:approval run=run-1 request=approval-1 decision=once]",
+      TS,
+    );
+    expect(result).toEqual([{ kind: "system", ts: TS, text: "Hermes approval: run=run-1 request=approval-1 decision=once" }]);
+  });
 });

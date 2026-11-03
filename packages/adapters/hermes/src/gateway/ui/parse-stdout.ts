@@ -1,5 +1,9 @@
 import type { TranscriptEntry } from "@paperclipai/adapter-utils";
 
+// Keep in sync with APPROVAL_MARKER in ../server/execute.ts (importing it here would pull the
+// whole server-side adapter into the browser bundle).
+const APPROVAL_LINE_PREFIX = "hermes-gateway:approval";
+
 /**
  * Strip ANSI escape sequences (CSI, OSC) from terminal text.
  * Same pattern used in claude-local adapter quota.ts.
@@ -76,6 +80,14 @@ export function parseHermesGatewayStdoutLine(line: string, ts: string): Transcri
       return [{ kind: "thinking", ts, text: reasoning || "Hermes reasoning available" }];
     }
     return [{ kind: "system", ts, text: `Hermes event: ${eventName}` }];
+  }
+
+  // Hermes human-approval bridge lines, e.g.
+  //   [hermes-gateway:approval run=r1 request=a1 waiting for a human decision]
+  // They carry no command text (the adapter redacts it before emitting).
+  if (trimmed.startsWith(`[${APPROVAL_LINE_PREFIX}`)) {
+    const inner = trimmed.replace(new RegExp(`^\\[${APPROVAL_LINE_PREFIX}|\\]$`, "g"), "").trim();
+    return [{ kind: "system", ts, text: inner ? `Hermes approval: ${inner}` : "Hermes approval request" }];
   }
 
   if (trimmed.startsWith("[hermes-gateway]")) {

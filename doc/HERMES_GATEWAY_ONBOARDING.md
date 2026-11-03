@@ -145,6 +145,56 @@ After Hermes submits the join request:
 Once the key is claimed, create an issue assigned to the new Hermes gateway
 agent and wake it through the normal Paperclip heartbeat path.
 
+## Command Approvals
+
+A Hermes run can pause on a guarded command and ask for consent. Paperclip
+drives that through the two `hermes_gateway` fields
+`headlessApprovalPolicy` and `approvalTimeoutSec`:
+
+```json
+{
+  "apiBaseUrl": "http://127.0.0.1:8642",
+  "apiKey": "<same-value-as-API_SERVER_KEY>",
+  "paperclipApiUrl": "http://127.0.0.1:3100",
+  "timeoutSec": 3600,
+  "headlessApprovalPolicy": "bridge",
+  "approvalTimeoutSec": 900
+}
+```
+
+- `deny` (the default) refuses any approval request immediately and fails the
+  run with `hermes_gateway_approval_timeout`. Use it for unattended agents
+  where a guarded command should simply be a hard failure.
+- `bridge` posts an approval card on the issue the run belongs to and waits for
+  a human. The card is a normal `ask_user_questions` interaction on the issue
+  thread, restricted to humans. It always offers Allow once / Deny, and adds
+  Allow for this run / Always allow only when the Hermes request advertises
+  those choices (`allowed_choices`). The adapter forwards the chosen answer
+  unchanged to
+  `POST /v1/runs/{run_id}/approval` and keeps streaming until Hermes finishes.
+
+Anything other than a clear human answer is a deny — no answer, an expired or
+cancelled card, a card superseded by a newer one, or an answer the adapter
+cannot parse. A bridge that cannot reach Paperclip (no `paperclipApiUrl`, no
+run access token, no issue) fails the run rather than approving anything.
+
+`timeoutSec` remains the hard wall for the whole run, and the approval wait is
+part of it, so the effective human budget is
+`min(approvalTimeoutSec, time left in the run - 10s)`. Because interactive
+gateway work routinely outlasts the 600-second default, operators commonly
+configure `timeoutSec` well above it, as in the example above; raise
+`approvalTimeoutSec` in step with it and keep it comfortably below `timeoutSec`
+so there is still time to do the approved work. Hermes has its own approval
+timer that Paperclip cannot read, so set `approvalTimeoutSec` to the value the
+Hermes server is configured with (about 300 seconds by default); a longer
+`approvalTimeoutSec` does not keep the request open on the Hermes side
+indefinitely.
+
+The adapter needs the run-scoped Paperclip access token to post the card, which
+is why `hermes_gateway` is registered with `supportsLocalAgentJwt`. Command text
+in the card and in the run log is redacted, and the Hermes API key is never
+forwarded to Paperclip.
+
 ## Local Fresh-State Smoke
 
 For a fresh Docker-backed Hermes gateway and end-to-end Paperclip join/run
