@@ -43,7 +43,7 @@ Optional fields:
 - timeoutSec (number): defaults to 600.
 - headlessApprovalPolicy (deny | bridge): defaults to deny. What to do when Hermes emits an approval.request event. deny posts choice=deny immediately and ends the run with hermes_gateway_approval_timeout. bridge posts an approval card on the Paperclip issue and waits for a human; the card is never answered by the adapter itself.
 - approvalTimeoutSec (number): defaults to 300, clamped to 15...3600. With bridge, how long to wait for the human answer before denying. Set it to the approval timeout the Hermes server is configured with (about 300s by default); Paperclip cannot read that Hermes-side setting. Always cut short before timeoutSec, and timeoutSec remains the hard wall for the whole run.
-- The approval wait is part of timeoutSec, not additional to it: the human gets min(approvalTimeoutSec, time left in the run - 10s). Interactive runs normally need timeoutSec raised well above the 600 default, with approvalTimeoutSec raised in step and kept comfortably below timeoutSec so the approved work still has time to run.
+- The approval wait is part of timeoutSec, not additional to it: one absolute deadline, min(approvalTimeoutSec, time left in the run - 10s), bounds every approval request at once - the card POST, each answer poll and the final deny - so a stalled HTTP call cannot outlive the run budget. If no budget remains, no card is posted and the command is denied immediately. Interactive runs normally need timeoutSec raised well above the 600 default, with approvalTimeoutSec raised in step and kept comfortably below timeoutSec so the approved work still has time to run.
 - eventReconnectMs (number): defaults to 2000.
 - instructions (string): stable Hermes instructions sent separately from wake input.
 
@@ -52,7 +52,7 @@ Runtime mapping:
 - Sends Idempotency-Key equal to the Paperclip run id for correlation only; Hermes v0.16.0 did not dedupe duplicate creates.
 - Streams GET /v1/runs/{run_id}/events and polls GET /v1/runs/{run_id} as fallback.
 - Calls POST /v1/runs/{run_id}/stop on timeout.
-- With headlessApprovalPolicy=bridge, answers POST /v1/runs/{run_id}/approval with the human's exact choice and request_id; an unanswered, cancelled, superseded or unparseable approval is always denied. Command text is redacted before it reaches the issue card or the logs.
+- With headlessApprovalPolicy=bridge, answers POST /v1/runs/{run_id}/approval with the human's exact choice and request_id (plus execution_generation for session-authority approvals); an unanswered, cancelled, superseded or unparseable approval is always denied, and a deny that Hermes never accepts fails the run rather than hanging it. A pending approval is re-discovered from GET /v1/runs/{id} pending_controls after an SSE drop. Command text is redacted before it reaches the issue card or the logs; a command that cannot be fully presented after redaction is denied without a card.
 
 Security guidance:
 - Prefer HTTPS or a private overlay network for non-loopback hosts.

@@ -72,6 +72,16 @@ function parseStdoutLine(line, ts) {
     return [{ kind: "system", ts, text: `Hermes event: ${eventName}` }];
   }
 
+  // Hermes human-approval bridge lines, e.g.
+  //   [hermes-gateway:approval run=r1 request=a1 waiting for a human decision]
+  // They carry no command text (the adapter redacts it before emitting).
+  // Keep in sync with the TypeScript parser in src/gateway/ui/parse-stdout.ts.
+  const APPROVAL_LINE_PREFIX = "hermes-gateway:approval";
+  if (trimmed.startsWith(`[${APPROVAL_LINE_PREFIX}`)) {
+    const inner = trimmed.replace(new RegExp(`^\\[${APPROVAL_LINE_PREFIX}|\\]$`, "g"), "").trim();
+    return [{ kind: "system", ts, text: inner ? `Hermes approval: ${inner}` : "Hermes approval request" }];
+  }
+
   if (trimmed.startsWith("[hermes-gateway]")) {
     return [{ kind: "system", ts, text: trimmed.replace(/^\[hermes-gateway\]\s*/, "") }];
   }

@@ -2,7 +2,6 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
 import {
-  approvalChoiceIds,
   buildApprovalInteractionBody,
   createApprovalInteraction,
   execute,
@@ -12,6 +11,7 @@ import {
   postApproval,
   resolveHermesApprovalChoice,
   type HermesApprovalChoice,
+  type HermesApprovalRequest,
   mapFinalResultForTest,
   parseSseFramesForTest,
   resolveSessionKey,
@@ -126,6 +126,7 @@ describe("extractApprovalRequest", () => {
       data: { request_id: "req-9", command: "DROP TABLE users", reason: "irreversible" },
     })).toEqual({
       requestId: "req-9",
+      binding: { protocol: "legacy" },
       command: "DROP TABLE users",
       reason: "irreversible",
       allowed: ["once", "deny"],
@@ -134,7 +135,7 @@ describe("extractApprovalRequest", () => {
 
   it("leaves command and reason null when Hermes omits them", () => {
     expect(extractApprovalRequest({ event: "approval.request", data: { request_id: "req-10" } }))
-      .toEqual({ requestId: "req-10", command: null, reason: null, allowed: ["once", "deny"] })
+      .toEqual({ requestId: "req-10", binding: { protocol: "legacy" }, command: null, reason: null, allowed: ["once", "deny"] })
   })
 
   it("keeps only the choices the request advertises", () => {
@@ -143,25 +144,72 @@ describe("extractApprovalRequest", () => {
       data: { request_id: "req-11", allowed_choices: ["once", "session", "always", "deny"] },
     })?.allowed).toEqual(["once", "session", "always", "deny"])
   })
-})
 
-describe("approvalChoiceIds", () => {
-  const cases: Array<[string, unknown, HermesApprovalChoice[]]> = [
-    ["no advertisement", undefined, ["once", "deny"]],
-    ["a non-list advertisement", "once", ["once", "deny"]],
-    ["a list of junk", [1, null, "nope"], ["once", "deny"]],
-    ["an empty list", [], ["once", "deny"]],
-    ["deny only", ["deny"], ["once", "deny"]],
-    ["an advertised subset", ["once", "session", "deny"], ["once", "session", "deny"]],
-    ["all four", ["once", "session", "always", "deny"], ["once", "session", "always", "deny"]],
-  ]
-
-  it.each(cases)("advertised %s offers %j", (_name, advertised, expected) => {
-    expect(approvalChoiceIds(advertised)).toEqual(expected)
+  // Session-authority wire format pinned to upstream Hermes
+  // 7b55a7c2363610cb3622f87ed66dcea18720bde6 (session_pending_controls.py
+  // `PendingControls.register`): kind "approval", prompt_id + int
+  // execution_generation, canonical `choices`, `description` as the reason.
+  it("parses a session-authority prompt with its execution generation", () => {
+    expect(extractApprovalRequest({
+      event: "approval.request",
+      data: {
+        kind: "approval",
+        prompt_id: "prompt-1",
+        execution_generation: 7,
+        command: "rm -rf /var/tmp/scratch",
+        description: "Deleting the scratch directory",
+        choices: ["once", "session", "always", "deny"],
+        timeout_s: 300,
+      },
+    })).toEqual({
+      requestId: "prompt-1",
+      binding: { protocol: "session_authority", executionGeneration: 7 },
+      command: "rm -rf /var/tmp/scratch",
+      reason: "Deleting the scratch directory",
+      allowed: ["once", "session", "always", "deny"],
+    })
   })
 
-  it("never drops deny", () => {
-    expect(approvalChoiceIds(["once", "always"])).toEqual(["once", "always", "deny"])
+  it.each([
+    ["absent", undefined],
+    ["a string", "7"],
+    ["not an integer", 7.5],
+    ["negative", -1],
+  ])("drops a session-authority prompt whose generation is %s", (_name, generation) => {
+    // Replying without the exact generation answers `stale_generation` upstream,
+    // so an unbound prompt must never reach the board.
+    const data: Record<string, unknown> = { kind: "approval", prompt_id: "prompt-1" }
+    if (generation !== undefined) data.execution_generation = generation
+    expect(extractApprovalRequest({ event: "approval.request", data })).toBeNull()
+  })
+
+  it("treats a legacy request_id prompt as legacy even with a generation alongside", () => {
+    // Upstream `_approval_request_event` (api_server.py) replies with only
+    // {choice, request_id}; an accompanying generation is not part of the reply.
+    expect(extractApprovalRequest({
+      event: "approval.request",
+      data: { request_id: "req-12", execution_generation: 3 },
+    })?.binding).toEqual({ protocol: "legacy" })
+  })
+
+  it("never widens the canonical choices ladder with an alias", () => {
+    const request = extractApprovalRequest({
+      event: "approval.request",
+      data: {
+        request_id: "req-13",
+        choices: ["once", "deny"],
+        allowed_choices: ["once", "session", "always", "deny"],
+      },
+    })
+    expect(request?.allowed).toEqual(["once", "deny"])
+  })
+
+  it("always keeps deny in the advertised ladder", () => {
+    const request = extractApprovalRequest({
+      event: "approval.request",
+      data: { request_id: "req-14", choices: ["once", "session"] },
+    })
+    expect(request?.allowed).toEqual(["once", "session", "deny"])
   })
 })
 
@@ -182,6 +230,46 @@ describe("extractPendingApproval", () => {
       return
     }
     expect(result?.requestId).toBe(expected)
+  })
+
+  // `pending_controls` in the run_projection snapshot, pinned to upstream
+  // Hermes 7b55a7c2363610cb3622f87ed66dcea18720bde6: the projection drops
+  // controls whose generation differs from the row's execution_generation.
+  it("recovers a session-authority prompt from pending_controls", () => {
+    expect(extractPendingApproval({
+      status: "waiting_for_approval",
+      run_id: "run-1",
+      execution_generation: 7,
+      pending_controls: [
+        { kind: "approval", prompt_id: "prompt-9", command: "rm -rf /var/tmp", description: "clear scratch", choices: ["once", "deny"] },
+      ],
+    })).toEqual({
+      requestId: "prompt-9",
+      binding: { protocol: "session_authority", executionGeneration: 7 },
+      command: "rm -rf /var/tmp",
+      reason: "clear scratch",
+      allowed: ["once", "deny"],
+    })
+  })
+
+  it("drops a pending control whose generation does not match the snapshot", () => {
+    expect(extractPendingApproval({
+      status: "waiting_for_approval",
+      execution_generation: 8,
+      pending_controls: [
+        { kind: "approval", prompt_id: "prompt-9", execution_generation: 7, choices: ["once", "deny"] },
+      ],
+    })).toBeNull()
+  })
+
+  it("ignores pending controls that are not approvals", () => {
+    expect(extractPendingApproval({
+      status: "waiting_for_approval",
+      execution_generation: 8,
+      pending_controls: [
+        { kind: "question", prompt_id: "prompt-1", choices: ["once", "deny"] },
+      ],
+    })).toBeNull()
   })
 })
 
@@ -222,6 +310,134 @@ describe("resolveHermesApprovalChoice", () => {
   })
 })
 
+// R1 (finding #2): the approval card must be a `request_checkbox_confirmation`
+// with the exact qualified candidate mapping — human-only resolver, no agent
+// continuation wakeup, exactly-one selection defaulted to deny.
+describe("approval confirmation mapping", () => {
+  const checkboxBody = (allowed?: HermesApprovalChoice[]) =>
+    buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command: "apt-get install -y curl",
+      reason: "needs a download tool",
+      allowed,
+    }) as Record<string, any>
+
+  it("requests a checkbox confirmation with the qualified candidate policy", () => {
+    const body = checkboxBody()
+    expect(body.kind).toBe("request_checkbox_confirmation")
+    expect(body.idempotencyKey).toBe("hermes-approval:run_7:req-1")
+    expect(body.resolverPolicy).toBe("human_only")
+    expect(body.continuationPolicy).toBe("none")
+    expect(body.supersedeOnUserComment ?? body.payload.supersedeOnUserComment).toBe(false)
+  })
+
+  it("carries a min-one max-one selection defaulted to deny", () => {
+    const { payload } = checkboxBody()
+    expect(payload.version).toBe(1)
+    expect(payload.minSelected).toBe(1)
+    expect(payload.maxSelected).toBe(1)
+    expect(payload.defaultSelectedOptionIds).toEqual(["deny"])
+    expect(payload.acceptLabel).toBe("Submit decision")
+    expect(payload.rejectLabel).toBe("Deny")
+    expect(payload.supersedeOnUserComment).toBe(false)
+    // A checkbox card has no question set; a stray `questions` array would be
+    // stripped by the validator and hide the real problem.
+    expect(payload.questions).toBeUndefined()
+  })
+
+  it("offers the advertised choices with deny last and bounded option fields", () => {
+    const { payload } = checkboxBody(["once", "session", "always", "deny"])
+    expect(payload.options.map((option: { id: string }) => option.id)).toEqual([
+      "once",
+      "session",
+      "always",
+      "deny",
+    ])
+    for (const option of payload.options) {
+      expect(typeof option.label).toBe("string")
+      expect(option.label.length).toBeGreaterThan(0)
+      expect(option.label.length).toBeLessThanOrEqual(120)
+      expect(typeof option.description).toBe("string")
+      expect(option.description.length).toBeLessThanOrEqual(500)
+    }
+  })
+
+  it("defaults the offered choices to once/deny", () => {
+    const { payload } = checkboxBody()
+    expect(payload.options.map((option: { id: string }) => option.id)).toEqual(["once", "deny"])
+  })
+
+  it("bounds the prompt to 1000 chars and puts the detail in detailsMarkdown", () => {
+    const body = buildApprovalInteractionBody({
+      key: "k",
+      requestId: "req-1",
+      command: "x".repeat(5000),
+      reason: null,
+    }) as Record<string, any>
+    const { title, summary, payload } = body
+    expect(title.length).toBeLessThanOrEqual(240)
+    expect(summary.length).toBeLessThanOrEqual(1000)
+    expect(typeof payload.prompt).toBe("string")
+    expect(payload.prompt.length).toBeGreaterThan(0)
+    expect(payload.prompt.length).toBeLessThanOrEqual(1000)
+    expect(typeof payload.detailsMarkdown).toBe("string")
+    expect(payload.detailsMarkdown.length).toBeLessThanOrEqual(20000)
+    expect(payload.detailsMarkdown).toContain("Command:")
+  })
+
+  it("says what happened when Hermes gave no command", () => {
+    const { payload } = buildApprovalInteractionBody({
+      key: "k",
+      requestId: "req-9",
+      command: null,
+      reason: null,
+    }) as Record<string, any>
+    expect(payload.detailsMarkdown).toContain("Hermes did not say what it wants to run.")
+    expect(payload.detailsMarkdown).not.toContain("undefined")
+  })
+
+  const accepted = (selectedOptionIds: unknown) => ({
+    status: "accepted",
+    result: { version: 1, outcome: "accepted", selectedOptionIds },
+  })
+  const resolveCases: Array<[string, unknown, HermesApprovalChoice]> = [
+    ["an accepted once", accepted(["once"]), "once"],
+    ["an accepted session", accepted(["session"]), "session"],
+    ["an accepted always", accepted(["always"]), "always"],
+    ["an accepted deny", accepted(["deny"]), "deny"],
+    ["an accepted card with no selection", accepted([]), "deny"],
+    ["an accepted card with two selections", accepted(["once", "session"]), "deny"],
+    ["an accepted card with an unknown id", accepted(["maybe"]), "deny"],
+    ["an accepted card with a non-string id", accepted([1]), "deny"],
+    ["an accepted card without selectedOptionIds", { status: "accepted", result: { version: 1, outcome: "accepted" } }, "deny"],
+    [
+      "an accepted card whose outcome is not accepted",
+      { status: "accepted", result: { version: 1, outcome: "superseded_by_comment", selectedOptionIds: ["once"] } },
+      "deny",
+    ],
+    ["a rejected confirmation", { status: "rejected", result: { version: 1, outcome: "rejected" } }, "deny"],
+    ["a superseded confirmation", { status: "superseded_by_comment", result: null }, "deny"],
+    ["a withdrawn confirmation", { status: "withdrawn", result: null }, "deny"],
+    ["a closed-issue confirmation", { status: "issue_closed", result: null }, "deny"],
+    ["a still-pending confirmation", { status: "pending", result: null }, "deny"],
+    ["an accepted confirmation with no result", { status: "accepted", result: null }, "deny"],
+  ]
+
+  it.each(resolveCases)("maps %s fail-closed", (_name, interaction, expected) => {
+    expect(resolveHermesApprovalChoice(interaction)).toBe(expected)
+  })
+
+  it("keeps mapping legacy ask_user_questions answers", () => {
+    expect(
+      resolveHermesApprovalChoice({
+        status: "answered",
+        result: { version: 1, answers: [{ questionId: "decision", optionIds: ["once"] }] },
+      }),
+    ).toBe("once")
+  })
+})
+
 describe("hermesApprovalKey", () => {
   it("namespaces the run and approval request ids", () => {
     expect(hermesApprovalKey("pc-run-1", "apr-1")).toBe("hermes-approval:pc-run-1:apr-1")
@@ -237,10 +453,27 @@ describe("hermesApprovalKey", () => {
     expect(hermesApprovalKey(runId, "a")).toHaveLength(255)
     expect(hermesApprovalKey(runId, "a")).not.toBeNull()
   })
+
+  it("binds a session-authority key to its execution generation", () => {
+    expect(hermesApprovalKey("pc-run-1", "prompt-9", 7)).toBe("hermes-approval:pc-run-1:prompt-9:g7")
+  })
+
+  it("gives every generation of the same prompt a distinct key", () => {
+    // A prompt re-registered at a newer generation must get a fresh card,
+    // otherwise the old answered interaction would be reused as consent.
+    expect(hermesApprovalKey("pc-run-1", "prompt-9", 7)).not.toBe(hermesApprovalKey("pc-run-1", "prompt-9", 8))
+    expect(hermesApprovalKey("pc-run-1", "prompt-9")).not.toBe(hermesApprovalKey("pc-run-1", "prompt-9", 7))
+  })
+
+  it("refuses an over-long key once the generation suffix is added", () => {
+    const prefix = "hermes-approval:"
+    const runId = "r".repeat(255 - prefix.length - 1 - 1)
+    expect(hermesApprovalKey(runId, "a", 7)).toBeNull()
+  })
 })
 
 describe("buildApprovalInteractionBody", () => {
-  it("asks one single-choice question carrying only once/deny by default", () => {
+  it("asks a min-one checkbox confirmation carrying only once/deny by default", () => {
     const body = buildApprovalInteractionBody({
       key: "hermes-approval:run_7:req-1",
       requestId: "req-1",
@@ -256,30 +489,27 @@ describe("buildApprovalInteractionBody", () => {
       payload: {
         version: number;
         supersedeOnUserComment: boolean;
-        runtimeRequestId: string;
-        questions: Array<Record<string, any>>;
+        minSelected: number;
+        maxSelected: number;
+        defaultSelectedOptionIds: string[];
+        options: Array<Record<string, any>>;
+        detailsMarkdown: string;
       };
     };
-    expect(body.kind).toBe("ask_user_questions");
+    expect(body.kind).toBe("request_checkbox_confirmation");
     expect(body.idempotencyKey).toBe("hermes-approval:run_7:req-1");
     // Must be answered by a human, and answering must not wake a second agent run.
     expect(body.resolverPolicy).toBe("human_only");
     expect(body.continuationPolicy).toBe("none");
     expect(body.payload.supersedeOnUserComment).toBe(false);
     expect(body.payload.version).toBe(1);
-    expect(body.payload.runtimeRequestId).toBe("req-1");
-    expect(body.payload.questions).toHaveLength(1);
-    const question = body.payload.questions[0];
-    expect(question.selectionMode).toBe("single");
-    expect(question.id).toBe("decision");
-    expect(question.allowOther).toBe(false);
-    expect((question.options as Array<Record<string, any>>).map((o) => o.id)).toEqual([
-      "once",
-      "deny",
-    ]);
+    expect(body.payload.minSelected).toBe(1);
+    expect(body.payload.maxSelected).toBe(1);
+    expect(body.payload.defaultSelectedOptionIds).toEqual(["deny"]);
+    expect(body.payload.options.map((o) => o.id)).toEqual(["once", "deny"]);
     expect(body.summary).toContain("apt-get install -y curl");
     expect(body.summary).toContain("needs a download tool");
-    expect(body.payload.questions[0].prompt).toContain("apt-get install -y curl");
+    expect(body.payload.detailsMarkdown).toContain("apt-get install -y curl");
   });
 
   it("offers the pattern choices Hermes advertises on the request", () => {
@@ -289,8 +519,8 @@ describe("buildApprovalInteractionBody", () => {
       command: "kubectl delete pod web-1",
       reason: null,
       allowed: ["once", "session", "always", "deny"],
-    }) as { payload: { questions: Array<{ options: Array<Record<string, any>> }> } };
-    const options = body.payload.questions[0].options;
+    }) as { payload: { options: Array<Record<string, any>> } };
+    const options = body.payload.options;
     expect(options.map((o) => o.id)).toEqual(["once", "session", "always", "deny"]);
     // Nothing may promise more than Hermes actually does.
     expect(options.find((o) => o.id === "session")?.label).toBe("Allow for this run");
@@ -299,27 +529,46 @@ describe("buildApprovalInteractionBody", () => {
   });
 
   it("keeps a long or control-character command inside the server's field limits", () => {
-    // Limits from packages/shared ask_user_questions validators: title 240,
-    // summary 1000, question prompt 4000.
+    // Limits from packages/shared request_checkbox_confirmation validators:
+    // title 240, summary 1000, detailsMarkdown 20000. Control characters are
+    // stripped before any length bound is applied.
     const body = buildApprovalInteractionBody({
       key: "hermes-approval:run_7:req-1",
       requestId: "req-1",
-      command: `echo ${"a".repeat(20000)}\u001b[2J`,
-      reason: "r".repeat(20000),
-    }) as { title: string; summary: string; payload: { questions: Array<{ prompt: string }> } };
+      command: `echo ${"a".repeat(900)}\u001b[2J`,
+      reason: "r".repeat(500),
+    }) as { title: string; summary: string; payload: { detailsMarkdown: string } };
     expect(body.title.length).toBeLessThanOrEqual(240);
     expect(body.summary.length).toBeLessThanOrEqual(1000);
-    expect(body.payload.questions[0].prompt.length).toBeLessThanOrEqual(4000);
+    expect(body.payload.detailsMarkdown.length).toBeLessThanOrEqual(20000);
     expect(body.summary).not.toContain("\u001b");
+    expect(body.payload.detailsMarkdown).not.toContain("\u001b");
+    // The human still sees the whole command inside the fence.
+    expect(body.payload.detailsMarkdown).toContain("a".repeat(900));
+  });
+
+  it("refuses the card instead of truncating an over-long command", () => {
+    // A command the human cannot fully see must never be half-shown: the
+    // builder refuses, and the bridge denies without creating a card.
+    const body = buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command: `echo ${"a".repeat(20000)}`,
+      reason: null,
+    }) as Record<string, unknown>;
+    expect(body.refused).toBe(true);
+    expect(body.payload).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain("a".repeat(100));
   });
 
   it("still asks something when Hermes sends no command or reason", () => {
     const body = buildApprovalInteractionBody({ key: "k", requestId: "req-1", command: null, reason: null }) as {
       summary: string;
-      payload: { questions: Array<{ prompt: string }> };
+      payload: { prompt: string; detailsMarkdown: string };
     };
     expect(body.summary).toContain("did not say");
-    expect(body.payload.questions[0].prompt.length).toBeGreaterThan(0);
+    expect(body.payload.detailsMarkdown).toContain("did not say");
+    expect(body.payload.prompt.length).toBeGreaterThan(0);
   });
 });
 
@@ -377,6 +626,13 @@ describe("createApprovalInteraction", () => {
 });
 
 describe("postApproval", () => {
+  const baseRequest = {
+    requestId: "req-1",
+    binding: { protocol: "legacy" } as const,
+    command: null,
+    reason: null,
+    allowed: ["once", "deny"] as HermesApprovalChoice[],
+  };
   const baseInput = {
     baseUrl: new URL("http://127.0.0.1:8642"),
     headers: {
@@ -384,11 +640,11 @@ describe("postApproval", () => {
     },
     runId: "run_7",
     key: "hermes-approval:run_7:req-1",
-    requestId: "req-1",
+    request: baseRequest,
     signal: new AbortController().signal,
   };
 
-  async function runWith(status: number) {
+  async function runWith(status: number, request: HermesApprovalRequest = baseRequest) {
     const calls: Array<{ url: string; init: any }> = [];
     const logs: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (url: string, init: any) => {
@@ -404,6 +660,7 @@ describe("postApproval", () => {
     try {
       const delivered = await postApproval({
         ...baseInput,
+        request,
         choice: "once",
         onLog,
       });
@@ -423,6 +680,26 @@ describe("postApproval", () => {
     // The answer must be idempotent on Hermes' side too, so a retry cannot
     // answer a later request under the same key.
     expect(calls[0].init.headers["Idempotency-Key"]).toBe("hermes-approval:run_7:req-1");
+  });
+
+  it("replies to a session-authority prompt with its exact execution generation", async () => {
+    // Upstream 7b55a7c236 `respond_run` accepts exactly
+    // {request_id, execution_generation, choice} for an authority prompt and
+    // answers `stale_generation` for anything else.
+    const { calls } = await runWith(200, {
+      ...baseRequest,
+      binding: { protocol: "session_authority", executionGeneration: 7 },
+    });
+    expect(JSON.parse(calls[0].init.body)).toEqual({
+      choice: "once",
+      request_id: "req-1",
+      execution_generation: 7,
+    });
+  });
+
+  it("never sends a generation for a legacy request_id prompt", async () => {
+    const { calls } = await runWith(200, { ...baseRequest });
+    expect(JSON.parse(calls[0].init.body)).not.toHaveProperty("execution_generation");
   });
 
   it("treats a 409 already-resolved answer as delivered and never retries", async () => {
@@ -1486,19 +1763,21 @@ const APPROVAL_REQUEST_EVENT = [
   "",
 ];
 
-function approvalAnswer(interactionId: string, optionIds: string[]) {
+function approvalAnswer(interactionId: string, selectedOptionIds: string[]) {
   return {
     interactions: [{
       id: interactionId,
       idempotencyKey: hermesApprovalKey("pc-run-1", "approval-1"),
-      kind: "ask_user_questions",
-      status: "answered",
-      result: { version: 1, answers: [{ questionId: "decision", optionIds }] },
+      kind: "request_checkbox_confirmation",
+      status: "accepted",
+      result: { version: 1, outcome: "accepted", selectedOptionIds },
     }],
   };
 }
 
-const PENDING_INTERACTION = { interactions: [{ id: "int-1", kind: "ask_user_questions", status: "pending" }] };
+const PENDING_INTERACTION = {
+  interactions: [{ id: "int-1", kind: "request_checkbox_confirmation", status: "pending" }],
+};
 
 /**
  * Fetch fake for the approval bridge. `interactions` is what the Paperclip poll returns on
@@ -1508,9 +1787,31 @@ function stubApprovalFetch(options: {
   interactions?: () => unknown;
   approvalStatus?: number;
   events?: string[];
+  /** Index in `events` where the stream stalls until the adapter has answered the approval. */
+  holdEventsUntilApproved?: number;
+  /** HTTP status the fake Paperclip returns when the adapter tries to create the card. */
+  createStatus?: number;
+  /** Body of GET /v1/runs/{id}; a test can script re-discovery of a pending approval here. */
+  status?: (observed: { approvals: number }) => unknown;
+  /** How many approval POSTs release a held event stream (default 1). */
+  holdUntilApprovedCount?: number;
+  /** When true the POST to /approval never resolves; it rejects when its signal aborts. */
+  holdApprovalPost?: boolean;
+  /** Resolve the POST to /approval only after this many ms (rejects on abort). */
+  holdPostMs?: number;
+  /** Written instead of the remaining events once an approval has been observed. */
+  resumption?: { eventsAfterApproval?: string[] };
+  /** When true the resumption stream stalls again at its second approval event until two answers land. */
+  holdSecondApproval?: boolean;
+  /** Body of POST /v1/runs/{id}/stop; when set, later status reads report `stopped`. */
+  stop?: () => unknown;
+  /** When true, POST /v1/runs/{id}/stop answers 500 (the adapter must still settle). */
+  stopStatus?: number;
 }) {
   const approvals: Array<Record<string, unknown>> = [];
   const createdInteractions: Array<Record<string, unknown>> = [];
+  const stops: Array<Record<string, unknown>> = [];
+  const counts = { statusReads: 0, interactionReads: 0 };
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const method = (init?.method ?? "GET").toUpperCase();
@@ -1520,25 +1821,108 @@ function stubApprovalFetch(options: {
     }
     if (method === "POST" && url.endsWith("/interactions")) {
       createdInteractions.push({ url, headers: { ...(init?.headers as Record<string, string>) }, body });
+      // A card that cannot be created must never be followed by an answer poll.
+      if (options.createStatus !== undefined && options.createStatus >= 300) {
+        return new Response(JSON.stringify({ error: "card refused" }), { status: options.createStatus });
+      }
       return new Response(JSON.stringify({ interaction: { id: "int-1" } }), { status: 201 });
     }
     if (method === "GET" && url.includes("/interactions")) {
+      counts.interactionReads += 1;
       return new Response(JSON.stringify(options.interactions ? options.interactions() : PENDING_INTERACTION), { status: 200 });
     }
     if (method === "POST" && url.endsWith("/approval")) {
       approvals.push({ url, headers: { ...(init?.headers as Record<string, string>) }, body });
+      if (options.holdApprovalPost) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("approval post stalled")));
+        });
+      }
+      if (options.holdPostMs !== undefined) {
+        // Hold the answer for holdPostMs; aborting resolves it as refused,
+        // which lets a test cancel exactly while the answer is in flight.
+        return new Promise<Response>((resolve, reject) => {
+          const timer = setTimeout(() => resolve(new Response(JSON.stringify({}), { status: 200 })), options.holdPostMs);
+          init?.signal?.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(new Error("approval post stalled"));
+          });
+        });
+      }
       return new Response(JSON.stringify({}), { status: options.approvalStatus ?? 200 });
     }
-    if (url.endsWith("/events")) {
-      return new Response(sseStream((options.events ?? []).join("\n")), {
-        status: 200,
-        headers: { "content-type": "text/event-stream" },
-      });
+    if (method === "POST" && url.endsWith("/stop")) {
+      stops.push({ url });
+      if (options.stopStatus !== undefined && options.stopStatus >= 300) {
+        return new Response(JSON.stringify({ error: "stop refused" }), { status: options.stopStatus });
+      }
+      return new Response(JSON.stringify(options.stop ? options.stop() : { run_id: "run-hermes-1", status: "stopping" }), { status: 200 });
     }
-    return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+    if (url.endsWith("/events")) {
+      const events = options.events ?? [];
+      const hold = options.holdEventsUntilApproved;
+      const body = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const encoder = new TextEncoder();
+          const write = (lines: string[]) => {
+            for (const line of lines) controller.enqueue(encoder.encode(`${line}\n`));
+          };
+          write(hold === undefined ? events : events.slice(0, hold));
+          if (hold !== undefined) {
+            // Hermes really does block the run while an approval is pending: nothing more is
+            // streamed until the adapter answers, so observation must stay live meanwhile.
+            const waitFor = async (needed: number) => {
+              const until = Date.now() + 5_000;
+              while (approvals.length < needed && Date.now() < until) {
+                await new Promise((resolve) => setTimeout(resolve, 5));
+              }
+              return approvals.length >= needed;
+            };
+            const res = options.resumption?.eventsAfterApproval;
+            if (!(await waitFor(options.holdUntilApprovedCount ?? 1))) {
+              // The answer never arrived in the fake's window; release like a dropped stream.
+              write(events.slice(hold));
+            } else if (options.holdSecondApproval && res) {
+              // Model the stream stalling again at the second approval request: everything up
+              // to the terminal event is written, then the stream waits for that answer.
+              const split = res.findIndex((line) => line.startsWith("event: run.completed")
+                || line.startsWith("event: run.failed")
+                || line.startsWith("event: run.cancelled"));
+              if (split === -1) write(res);
+              else {
+                write(res.slice(0, split));
+                if (await waitFor(2)) write(res.slice(split));
+              }
+            } else {
+              write(res || events.slice(hold));
+            }
+          }
+          controller.close();
+        },
+      });
+      return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    counts.statusReads += 1;
+    // Once /stop was accepted, status reads report the stopped run so the
+    // adapter's bounded terminal observation completes (mirrors Hermes).
+    if (stops.length > 0 && options.stopStatus === undefined) {
+      return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "cancelled" }), { status: 200 });
+    }
+    return new Response(JSON.stringify(options.status ? options.status({ approvals: approvals.length }) : { status: "running" }), { status: 200 });
   });
   vi.stubGlobal("fetch", fetchMock);
-  return { fetchMock, approvals, createdInteractions };
+  return {
+    fetchMock,
+    approvals,
+    createdInteractions,
+    stops,
+    get statusReads() {
+      return counts.statusReads;
+    },
+    get interactionReads() {
+      return counts.interactionReads;
+    },
+  };
 }
 
 function makeApprovalCtx(config: Record<string, unknown>): AdapterExecutionContext {
@@ -1562,6 +1946,9 @@ describe("hermes_gateway approval bridge", () => {
         return polls < 2 ? PENDING_INTERACTION : approvalAnswer("int-1", ["once"]);
       },
       events: [...APPROVAL_REQUEST_EVENT, "event: run.completed", 'data: {"status":"completed","output":"done"}', ""],
+      // Hermes blocks the run while an approval is pending, so the terminal event can only
+      // arrive after the answer.
+      holdEventsUntilApproved: 3,
     });
 
     const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
@@ -1578,15 +1965,15 @@ describe("hermes_gateway approval bridge", () => {
     });
     const cardBody = card.body as Record<string, any>;
     expect(cardBody).toMatchObject({
-      kind: "ask_user_questions",
+      kind: "request_checkbox_confirmation",
       idempotencyKey: hermesApprovalKey("pc-run-1", "approval-1"),
       resolverPolicy: "human_only",
       continuationPolicy: "none",
     });
     // The request advertises no choice list, so only the always-valid choices appear.
-    expect(cardBody.payload.questions[0].options.map((option: { id: string }) => option.id))
+    expect(cardBody.payload.options.map((option: { id: string }) => option.id))
       .toEqual(["once", "deny"]);
-    expect(cardBody.payload.questions[0].prompt).toContain("Deleting the scratch directory");
+    expect(cardBody.payload.detailsMarkdown).toContain("Deleting the scratch directory");
 
     expect(stub.approvals).toHaveLength(1);
     expect(stub.approvals[0]).toMatchObject({
@@ -1611,13 +1998,15 @@ describe("hermes_gateway approval bridge", () => {
         'data: {"status":"completed","output":"done"}',
         "",
       ],
+      // Hermes blocks while an approval is pending: the terminal event follows the answer.
+      holdEventsUntilApproved: 3,
     });
 
     const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
 
     expect(result.exitCode).toBe(0);
     const cardBody = stub.createdInteractions[0].body as Record<string, any>;
-    expect(cardBody.payload.questions[0].options.map((option: { id: string }) => option.id))
+    expect(cardBody.payload.options.map((option: { id: string }) => option.id))
       .toEqual(["once", "session", "always", "deny"]);
     expect(stub.approvals[0]).toMatchObject({
       body: { choice: "session", request_id: "approval-1" },
@@ -1628,6 +2017,7 @@ describe("hermes_gateway approval bridge", () => {
     const stub = stubApprovalFetch({
       interactions: () => approvalAnswer("int-1", ["deny"]),
       events: [...APPROVAL_REQUEST_EVENT, "event: run.completed", 'data: {"status":"completed","output":"done"}', ""],
+      holdEventsUntilApproved: 3,
     });
 
     const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
@@ -1696,9 +2086,10 @@ describe("hermes_gateway approval bridge", () => {
     const started = Date.now();
     const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge", timeoutSec: 3 }));
 
+    // R4: with no budget left there is no card and not even a first read.
     expect(Date.now() - started).toBeLessThan(2_000);
-    expect(polls).toBe(1);
-    expect(stub.createdInteractions).toHaveLength(1);
+    expect(polls).toBe(0);
+    expect(stub.createdInteractions).toHaveLength(0);
     expect(stub.approvals).toHaveLength(1);
     expect(stub.approvals[0]).toMatchObject({ body: { choice: "deny", request_id: "approval-1" } });
     expect(result.exitCode).toBe(1);
@@ -1711,7 +2102,11 @@ describe("hermes_gateway approval bridge", () => {
     const baseFetch = stub.fetchMock;
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/v1/runs/run-hermes-1")) {
+      const isStop = (init?.method ?? "GET").toUpperCase() === "POST" && url.endsWith("/stop");
+      // Status reads keep reporting the pending approval (so the recovery path
+      // stays exercised); /stop and its observation go to the base fake, which
+      // reports the run cancelled after a stop — like Hermes.
+      if (url.endsWith("/v1/runs/run-hermes-1") && !isStop) {
         statusReads += 1;
         return new Response(JSON.stringify({
           status: "awaiting_approval",
@@ -1746,4 +2141,775 @@ describe("hermes_gateway approval bridge", () => {
     expect(logged.join("")).toContain("hermes-gateway:approval");
     expect(stub.approvals).toHaveLength(1);
   });
+});
+
+describe("hermes_gateway approval lifecycle", () => {
+  const approvalError = (result: { errorCode?: string | null }, code: string) => result.errorCode === code;
+
+  /** An approval ctx with every onLog line captured, for tests that assert what the run reported. */
+  function loggedApprovalCtx(config: Record<string, unknown>) {
+    const logs: string[] = [];
+    const ctx = makeApprovalCtx(config);
+    const inner = ctx.onLog;
+    ctx.onLog = (stream: "stdout" | "stderr", chunk: string) => {
+      logs.push(chunk);
+      return inner(stream, chunk);
+    };
+    return { ctx, logs };
+  }
+
+  it("keeps reading run status while a card waits, and reports no failure when the run completes", async () => {
+    let polls = 0;
+    const stub = stubApprovalFetch({
+      interactions: () => {
+        polls += 1;
+        return polls < 3 ? PENDING_INTERACTION : approvalAnswer("int-1", ["once"]);
+      },
+      events: [...APPROVAL_REQUEST_EVENT, "event: run.completed", 'data: {"status":"completed","output":"done"}', ""],
+      holdEventsUntilApproved: 3,
+    });
+    const { ctx, logs } = loggedApprovalCtx({ headlessApprovalPolicy: "bridge", pollIntervalMs: 250 });
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("done");
+    expect(result.errorMessage).toBeUndefined();
+    // The bridge never blocks observation: the run view keeps being polled while the
+    // human decides, so a terminal event arriving later is still acted on.
+    expect(stub.statusReads).toBeGreaterThanOrEqual(2);
+    expect(stub.interactionReads).toBeGreaterThanOrEqual(3);
+    expect(logs.some((line) => line.includes("waiting for a human decision"))).toBe(true);
+  });
+
+  it("terminates the run when the stream completes while a card is still pending, after denying the command", { timeout: 20_000 }, async () => {
+    const stub = stubApprovalFetch({
+      interactions: () => PENDING_INTERACTION,
+      events: [...APPROVAL_REQUEST_EVENT, "event: run.completed", 'data: {"status":"completed","output":"done"}', ""],
+      holdEventsUntilApproved: 3,
+    });
+    const { ctx, logs } = loggedApprovalCtx({ headlessApprovalPolicy: "bridge" });
+
+    const result = await execute(ctx);
+
+    // The gateway says the run is finished; Paperclip must not wait for the card.
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("done");
+    // Denying an unanswered request is still attempted before this run settles.
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.approvals[0].body).toMatchObject({ choice: "deny", request_id: "approval-1" });
+    expect(logs.some((line) => line.includes("unanswered approval denied"))).toBe(true);
+  });
+
+  it("fails the run with bridge_failed rather than a connection failure when no card can be created", async () => {
+    const stub = stubApprovalFetch({
+      createStatus: 403,
+      events: [...APPROVAL_REQUEST_EVENT],
+      holdEventsUntilApproved: 3,
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+
+    // A rejected card is an approval failure, not a gateway connection failure.
+    expect(approvalError(result, "hermes_gateway_approval_bridge_failed")).toBe(true);
+    expect((result.resultJson as Record<string, any> | undefined)?.connectionFailure).toBeUndefined();
+    // Hermes is refused, and Paperclip is never polled for an answer that cannot arrive.
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.approvals[0].body).toMatchObject({ choice: "deny" });
+    expect(stub.interactionReads).toBe(0);
+  });
+
+  it("fails the run with bridge_failed when Hermes refuses the approval answer", async () => {
+    const stub = stubApprovalFetch({
+      approvalStatus: 500,
+      interactions: () => approvalAnswer("int-1", ["once"]),
+      events: [...APPROVAL_REQUEST_EVENT],
+      holdEventsUntilApproved: 3,
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+
+    // The human answered, but Hermes never accepted the answer.
+    expect(approvalError(result, "hermes_gateway_approval_bridge_failed")).toBe(true);
+    expect(stub.createdInteractions).toHaveLength(1);
+    // The human answer was attempted, then the run fails closed with a deny.
+    expect(stub.approvals.map((entry) => (entry.body as Record<string, any>).choice)).toEqual(["once", "deny"]);
+  });
+
+  it("refuses a second approval request when the bridge is already busy", async () => {
+    const second = 'event: approval.request\ndata: {"request_id":"approval-2","command":"rm -rf /srv/other","sandbox":"docker","reason":"second request"}\n';
+    const stub = stubApprovalFetch({
+      interactions: () => PENDING_INTERACTION,
+      events: [
+        ...APPROVAL_REQUEST_EVENT,
+        second,
+        "event: run.completed",
+        'data: {"status":"completed","output":"done"}',
+        "",
+      ],
+      holdEventsUntilApproved: 4,
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+
+    // Only the first request can be bridged; the second is refused instead of queued.
+    expect(stub.createdInteractions).toHaveLength(1);
+    const denials = stub.approvals.filter((entry) => (entry.body as Record<string, any>).choice === "deny");
+    // The refused request is denied immediately; the still-unanswered first one is
+    // denied too as the run settles.
+    expect(denials.map((entry) => (entry.body as Record<string, any>).request_id)).toContain("approval-2");
+    expect(result.exitCode).not.toBe(0);
+    expect(approvalError(result, "hermes_gateway_approval_bridge_failed")).toBe(true);
+  });
+
+  it("never raises a second card or sends a second approval when the stream is re-read", async () => {
+    let polls = 0;
+    const stub = stubApprovalFetch({
+      interactions: () => {
+        polls += 1;
+        return polls < 3 ? PENDING_INTERACTION : approvalAnswer("int-1", ["once"]);
+      },
+      // The run status keeps publishing the pending approval, so status polling
+      // re-discovers the same request over and over during the human wait.
+      status: ({ approvals }) =>
+        approvals === 0
+          ? {
+              status: "running",
+              pending_approval: {
+                request_id: "approval-1",
+                command: "rm -rf /srv/app/cache",
+                sandbox: "docker",
+                reason: "still waiting",
+              },
+            }
+          : { status: "running" },
+      events: [...APPROVAL_REQUEST_EVENT, "event: run.completed", 'data: {"status":"completed","output":"done"}', ""],
+      holdEventsUntilApproved: 3,
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge", pollIntervalMs: 250 }));
+
+    expect(result.exitCode).toBe(0);
+    // Run status re-discovered the same request repeatedly, yet only one card and
+    // one forwarded answer exist because the request is identified by its binding.
+    expect(stub.statusReads).toBeGreaterThanOrEqual(3);
+    expect(stub.createdInteractions).toHaveLength(1);
+    expect(stub.approvals).toHaveLength(1);
+  });
+
+  it("bridges a second approval request after the first one is answered", { timeout: 20_000 }, async () => {
+    const second = 'event: approval.request\ndata: {"request_id":"approval-2","command":"rm -rf /srv/other","sandbox":"docker","reason":"second request"}\n';
+    const stub = stubApprovalFetch({
+      interactions: () => approvalAnswer("int-1", ["once"]),
+      events: [...APPROVAL_REQUEST_EVENT],
+      holdEventsUntilApproved: 3,
+      // Hermes blocks again while the second approval is pending, so the
+      // terminal event only arrives after both answers.
+      holdSecondApproval: true,
+      // Hermes only resumes the stream once the first approval is answered; the
+      // second request appears after that point.
+      resumption: {
+        eventsAfterApproval: [
+          "event: run.output",
+          'data: {"text":"first approved"}',
+          "",
+          second,
+          "event: run.completed",
+          'data: {"status":"completed","output":"done"}',
+          "",
+        ],
+      },
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+
+    expect(result.exitCode).toBe(0);
+    expect(stub.createdInteractions).toHaveLength(2);
+    const forwarded = stub.approvals.map((entry) => entry.body as Record<string, any>);
+    expect(forwarded).toEqual([
+      expect.objectContaining({ choice: "once", request_id: "approval-1" }),
+      expect.objectContaining({ choice: "once", request_id: "approval-2" }),
+    ]);
+  });
+
+  it("uses the new session generation as the approval identity after a resume", { timeout: 20_000 }, async () => {
+    const stub = stubApprovalFetch({
+      interactions: () => approvalAnswer("int-1", ["once"]),
+      // Once the first approval is answered, the run status publishes the same
+      // session-authority prompt at a new execution generation: that is a new
+      // approval, not a replay of the answered one.
+      status: ({ approvals }) =>
+        approvals >= 2
+          ? { status: "completed", output: "done" }
+          : approvals === 1
+          ? {
+              status: "running",
+              execution_generation: 2,
+              pending_controls: [
+                {
+                  kind: "approval",
+                  prompt_id: "approval-1",
+                  execution_generation: 2,
+                  command: "rm -rf /srv/app/cache",
+                  sandbox: "docker",
+                  reason: "out-of-band approval",
+                },
+              ],
+            }
+          : { status: "running" },
+      events: [...APPROVAL_REQUEST_EVENT],
+      holdEventsUntilApproved: 3,
+      holdUntilApprovedCount: 2,
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge", pollIntervalMs: 250 }));
+
+    expect(result.exitCode).toBe(0);
+    // A new execution generation is a new approval, so it gets its own card rather
+    // than being merged into the already answered request.
+    expect(stub.createdInteractions.length).toBeGreaterThanOrEqual(2);
+    const keys = stub.createdInteractions.map((entry) => (entry.body as Record<string, any>).idempotencyKey);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(String(keys[1])).toContain(":g2");
+  });
+
+  it("reports an honest failure when approval cleanup cannot settle within its window", { timeout: 40_000 }, async () => {
+    // The approval deadline expires with no human answer, and even the required
+    // denial stalls until its own bounded cleanup window fires.
+    stubApprovalFetch({
+      interactions: () => PENDING_INTERACTION,
+      holdApprovalPost: true,
+      events: [...APPROVAL_REQUEST_EVENT],
+    });
+
+    // approvalTimeoutSec clamps to a minimum of 15s; the stalled denial gets the
+    // 10s cleanup window. The run must settle on those, not the whole-run timeout.
+    const result = await execute(
+      makeApprovalCtx({ headlessApprovalPolicy: "bridge", approvalTimeoutSec: 15, timeoutSec: 30 }),
+    );
+
+    // An unanswered approval is reported as an approval failure, never a connection failure.
+    expect(approvalError(result, "hermes_gateway_approval_timeout")).toBe(true);
+    expect(result.exitCode).not.toBe(0);
+  });
+
+  it("reports the expired approval as an unanswered timeout rather than a human decision", async () => {
+    const stub = stubApprovalFetch({
+      interactions: () => ({
+        interaction: { id: "int-1", status: "pending" },
+        interactions: [{ id: "int-1", kind: "request_checkbox_confirmation", status: "expired", payload: {} }],
+      }),
+      events: [...APPROVAL_REQUEST_EVENT],
+      holdEventsUntilApproved: 3,
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+
+    // Nobody answered, so this is the same outcome as never answering.
+    expect(approvalError(result, "hermes_gateway_approval_timeout")).toBe(true);
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.approvals[0].body).toMatchObject({ choice: "deny" });
+  });
+
+  it("reports a card rejected for a duplicate key as an approval failure, not a connection failure", async () => {
+    const stub = stubApprovalFetch({
+      createStatus: 409,
+      events: [...APPROVAL_REQUEST_EVENT],
+      holdEventsUntilApproved: 3,
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+
+    expect(approvalError(result, "hermes_gateway_approval_bridge_failed")).toBe(true);
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.createdInteractions).toHaveLength(1);
+  });
+
+  it("keeps the human's own answer when the card is already resolved", async () => {
+    const stub = stubApprovalFetch({
+      interactions: () => ({
+        interactions: [
+          {
+            id: "int-1",
+            idempotencyKey: hermesApprovalKey("pc-run-1", "approval-1"),
+            kind: "request_checkbox_confirmation",
+            status: "accepted",
+            result: { version: 1, outcome: "accepted", selectedOptionIds: ["once"] },
+          },
+        ],
+      }),
+      events: [...APPROVAL_REQUEST_EVENT, "event: run.completed", 'data: {"status":"completed","output":"done"}', ""],
+      holdEventsUntilApproved: 3,
+    });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+
+    expect(result.exitCode).toBe(0);
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.approvals[0].body).toMatchObject({ choice: "once", request_id: "approval-1" });
+  });
+
+  it("never reports an approval problem as a gateway connection failure", { timeout: 30_000 }, async () => {
+    // A real approval request, but this run has no Paperclip access token to raise a card with.
+    stubApprovalFetch({ events: [...APPROVAL_REQUEST_EVENT] });
+    const noTokenCtx = { ...makeApprovalCtx({ headlessApprovalPolicy: "bridge" }) };
+    delete (noTokenCtx as any).authToken;
+    const noTokenRun = await execute(noTokenCtx);
+    expect(approvalError(noTokenRun, "hermes_gateway_approval_unconfigured")).toBe(true);
+    expect(noTokenRun.exitCode).not.toBe(0);
+
+    // An approval event with no request id cannot be answered by a human.
+    const stub = stubApprovalFetch({
+      events: [
+        "event: approval.request",
+        'data: {"command":"rm -rf /srv/app/cache","reason":"missing id"}',
+        "",
+      ],
+    });
+    const unparseable = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+    expect(approvalError(unparseable, "hermes_gateway_approval_unparseable")).toBe(true);
+    expect(stub.createdInteractions).toHaveLength(0);
+
+    // A gateway credential problem is still reported as a configuration failure.
+    const missingKey = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge", apiKey: undefined as any }));
+    expect(missingKey.errorMessage).toContain("apiKey");
+  });
+
+});
+describe("hermes_gateway approval error message", () => {
+  // R6 (finding #9): the final result preserves the concrete terminal approval
+  // explanation through the shared redaction path instead of replacing it with
+  // a generic "Hermes run failed".
+
+  it("explains that no Paperclip access token exists to raise a card with", async () => {
+    stubApprovalFetch({ events: [...APPROVAL_REQUEST_EVENT] });
+    const ctx = { ...makeApprovalCtx({ headlessApprovalPolicy: "bridge" }) };
+    delete (ctx as any).authToken;
+
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("hermes_gateway_approval_unconfigured");
+    expect(result.errorMessage).toContain("Paperclip API URL, a run access token");
+  });
+
+  it("explains that Paperclip rejected the approval card, with the HTTP status", async () => {
+    stubApprovalFetch({ createStatus: 403, events: [...APPROVAL_REQUEST_EVENT], holdEventsUntilApproved: 3 });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+
+    expect(result.errorCode).toBe("hermes_gateway_approval_bridge_failed");
+    expect(result.errorMessage).toContain("Paperclip rejected the approval request (HTTP 403)");
+  });
+
+  it("explains that no human decision arrived when the approval wait ends unanswered", { timeout: 40_000 }, async () => {
+    stubApprovalFetch({ interactions: () => PENDING_INTERACTION, events: [...APPROVAL_REQUEST_EVENT] });
+
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge", approvalTimeoutSec: 15 }));
+
+    expect(result.errorCode).toBe("hermes_gateway_approval_timeout");
+    expect(result.errorMessage).toContain("no human decision was received");
+  });
+});
+
+describe("hermes_gateway approval deadline", () => {
+  // R4 (§11): one absolute approval deadline covers every awaited call — the
+  // card POST, every status read, the JSON body, and the answer POST — so a
+  // stalled HTTP call can never hold the run past its own budget. A reply
+  // that arrives after the deadline is never forwarded to Hermes.
+
+  const stalled = (signal: AbortSignal | undefined, ms: number): Promise<Response> =>
+    new Promise((_resolve, reject) => {
+      setTimeout(() => reject(new Error("watchdog: never aborted")), ms);
+      signal?.addEventListener("abort", () => reject(new Error("aborted-by-deadline")));
+    });
+
+  const pendingResponse = () => ({
+    status: 200,
+    ok: true,
+    json: async () => ({ interactions: [{ id: "int-1", kind: "request_checkbox_confirmation", status: "pending" }] }),
+  }) as unknown as Response;
+
+  const deadlineFetch = (behaviour: {
+    create?: (signal: AbortSignal | undefined) => Promise<Response>;
+    read?: (signal: AbortSignal | undefined) => Promise<Response>;
+  }) => {
+    const base = stubApprovalFetch({ events: APPROVAL_REQUEST_EVENT });
+    const calls = { base, creates: 0, reads: 0, approvals: [] as Array<Record<string, unknown>> };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const signal = init?.signal ?? undefined;
+      if (url.endsWith("/approval")) {
+        calls.approvals.push(JSON.parse(String(init?.body)));
+        return { status: 200, ok: true, json: async () => ({ ok: true }) } as Response;
+      }
+      if (url.includes("/interactions") && (init?.method ?? "GET") === "POST") {
+        calls.creates += 1;
+        if (behaviour.create) return behaviour.create(signal);
+        return { status: 201, ok: true, json: async () => ({ interaction: { id: "int-1" } }) } as Response;
+      }
+      if (url.includes("/interactions")) {
+        calls.reads += 1;
+        if (behaviour.read) return behaviour.read(signal);
+        return pendingResponse();
+      }
+      return base.fetchMock(input as never, init as never);
+    }));
+    return calls;
+  };
+
+  it("stops waiting as soon as the operator cancels, and still denies the Hermes command", async () => {
+    const calls = deadlineFetch({ create: (signal) => stalled(signal, 8_000) });
+    const ctx = makeApprovalCtx({ headlessApprovalPolicy: "bridge" });
+    const controller = new AbortController();
+    ctx.signal = controller.signal;
+    setTimeout(() => controller.abort(), 150);
+
+    const started = Date.now();
+    const result = await execute(ctx);
+
+    // The stalled card POST must not hold the run for its full 8s stall.
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(calls.approvals).toHaveLength(1);
+    expect(calls.approvals[0]).toMatchObject({ choice: "deny", request_id: "approval-1" });
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("aborts a stalled approval read at the run deadline instead of hanging", async () => {
+    // The run itself only has 4s, so the approval deadline is already gone;
+    // a hanging GET must be cut off there rather than at the 9s watchdog.
+    const calls = deadlineFetch({ read: (signal) => stalled(signal, 9_000) });
+    const started = Date.now();
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge", timeoutSec: 12 }));
+
+    expect(Date.now() - started).toBeLessThan(6_000);
+    expect(calls.reads).toBeGreaterThanOrEqual(1);
+    expect(calls.approvals).toHaveLength(1);
+    expect(calls.approvals[0]).toMatchObject({ choice: "deny", request_id: "approval-1" });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_approval_timeout");
+  });
+
+  it("never forwards an answer that arrives after the approval deadline", async () => {
+    // Human answers at 1.2s, but the run budget (3s) minus the stop grace has
+    // already expired by then, so the deny path must win and the card is
+    // closed as unanswered — never a late approve.
+    const started = Date.now();
+    const calls = deadlineFetch({
+      read: async () => {
+        if (Date.now() - started < 4_200) return pendingResponse();
+        return {
+          status: 200,
+          ok: true,
+          json: async () => approvalAnswer("int-1", ["once"]),
+        } as unknown as Response;
+      },
+    });
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge", timeoutSec: 3 }));
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_approval_timeout");
+    // Exactly one POST to Hermes: the bounded deny. Never an approve.
+    expect(calls.approvals).toHaveLength(1);
+    expect(calls.approvals[0]).toMatchObject({ choice: "deny", request_id: "approval-1" });
+  });
+
+  it("keeps the approval wait bounded even when timeoutSec is 0", async () => {
+    // timeoutSec: 0 removes the overall run deadline, but the approval wait
+    // itself is still bounded by the approval timeout, so a stalled read
+    // cannot hang forever. Cancel the operator side after 1.5s to end the
+    // run; the point is the run is NOT already finished at 6s.
+    const calls = deadlineFetch({ read: async () => pendingResponse() });
+    const ctx = makeApprovalCtx({
+      headlessApprovalPolicy: "bridge",
+      timeoutSec: 0,
+      approvalTimeoutSec: 3600,
+    });
+    const controller = new AbortController();
+    ctx.signal = controller.signal;
+    setTimeout(() => controller.abort(), 1_500);
+
+    const started = Date.now();
+    const result = await execute(ctx);
+
+    expect(Date.now() - started).toBeLessThan(4_000);
+    expect(calls.reads).toBeGreaterThanOrEqual(1);
+    expect(result.exitCode).toBe(1);
+  });
+});
+
+describe("approval command safety", () => {
+  // R3 (§11): the approval card must never carry unredacted secrets, and a
+  // human must see the whole command they are approving. If either is
+  // impossible the card is refused (deny), never half-shown.
+
+  it("redacts --api-key and password CLI arguments before anything is written", () => {
+    const body = buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command: "tool --api-key ABCD1234efgh --password p@ssw0rd-99 install",
+      reason: null,
+    }) as Record<string, any>;
+    const json = JSON.stringify(body);
+    expect(json).not.toContain("ABCD1234efgh");
+    expect(json).not.toContain("p@ssw0rd-99");
+    // The human still understands what kind of command this is.
+    expect(json).toContain("--api-key");
+    expect(json).toContain("install");
+  });
+
+  it("redacts secret env assignments and bearer/JWT forms in command and reason", () => {
+    const body = buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command: "API_KEY=zzz-top-secret curl -H 'Authorization: Bearer abcdefgh.ijklmnop.qrstuvwx' https://api.example.com",
+      reason: 'gateway said {"token":"diag-token-9876543210","ok":true}',
+    }) as Record<string, any>;
+    const json = JSON.stringify(body);
+    expect(json).not.toContain("zzz-top-secret");
+    expect(json).not.toContain("abcdefgh.ijklmnop.qrstuvwx");
+    expect(json).not.toContain("diag-token-9876543210");
+  });
+
+  it("refuses to present a command that cannot fit the details limit after redaction", () => {
+    // Overlong and unsanitisable (control characters survive as spaces, so the
+    // only bound left is the 20 000-char detailsMarkdown cap).
+    const marker = "q".repeat(30_000);
+    const body = buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command: marker,
+      reason: "very long reason " + "r".repeat(30_000),
+    }) as Record<string, any>;
+    expect(body.refused).toBe(true);
+    expect(body.payload?.detailsMarkdown).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain(marker);
+  });
+
+  it("never sends secrets or an overlong command to Paperclip and denies the run", async () => {
+    const secret = "live-secret-token-1234567890";
+    const longCommand = `echo ${"z".repeat(30_000)} --api-key ${secret}`;
+    const logged: string[] = [];
+    const base = makeApprovalCtx({ headlessApprovalPolicy: "bridge" });
+    const ctx: AdapterExecutionContext = {
+      ...base,
+      onLog: async (_stream: string, text: string) => { logged.push(text); },
+    };
+    const events = [
+      "event: approval.request",
+      "data: " + JSON.stringify({ request_id: "approval-1", command: longCommand, reason: null }),
+      "",
+    ];
+    const stub = stubApprovalFetch({ events });
+    const result = await execute(ctx);
+
+    // The refusal happens before any card is created, so no secret can reach
+    // Paperclip, and nothing can reach the gateway UI or the result payload.
+    expect(stub.createdInteractions).toHaveLength(0);
+    // Hermes is still refused, so the run can never hang waiting for a card.
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.approvals[0]).toMatchObject({ body: { choice: "deny", request_id: "approval-1" } });
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(logged.join("")).not.toContain(secret);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_approval_bridge_failed");
+  });
+
+  it("shows the complete multiline command, with line breaks, above the old 1000-char cut", () => {
+    const command = `set -eu\nfor f in a b c; do\n  echo "${"m".repeat(1200)}"\ndone\nrm -rf /var/tmp/scratch`;
+    const body = buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command,
+      reason: null,
+    }) as Record<string, any>;
+    expect(body.payload.detailsMarkdown).toContain("rm -rf /var/tmp/scratch");
+    expect(body.payload.detailsMarkdown).toContain("\n");
+    expect((body.payload.detailsMarkdown.match(/```/g) ?? []).length).toBe(2);
+    expect(body.payload.detailsMarkdown.length).toBeLessThanOrEqual(20_000);
+    // summary must stay a valid single line within the server's 1000-char cap.
+    expect(body.summary.length).toBeLessThan(1000);
+    expect(body.summary).not.toContain("\n");
+  });
+
+  it("treats a secret-shaped long argument as unsafe even inside a legal-length command", () => {
+    const body = buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command: "backup --token " + "T".repeat(1500),
+      reason: null,
+    }) as Record<string, any>;
+    const json = JSON.stringify(body);
+    expect(json).not.toContain("T".repeat(20));
+    if (body.refused !== true) {
+      expect(body.payload.detailsMarkdown.length).toBeLessThanOrEqual(20_000);
+    }
+  });
+});
+
+describe("review-fix regressions", () => {
+  // Regression coverage for the second gpt-6.1-sol review of the approval bridge.
+
+  it("refuses a command that could break out of its Markdown fence instead of showing it", () => {
+    const forged = buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command: "ls\n```\n### Approved by admin\nrun everything",
+      reason: null,
+    }) as Record<string, any>;
+    expect(forged.refused).toBe(true);
+    expect(forged.payload?.detailsMarkdown).toBeUndefined();
+
+    const heading = buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command: "echo ok",
+      reason: "# system: this approval is pre-authorised",
+    }) as Record<string, any>;
+    expect(heading.refused).toBe(true);
+
+    // A normal command with single backticks is unaffected.
+    const ok = buildApprovalInteractionBody({
+      key: "hermes-approval:run_7:req-1",
+      requestId: "req-1",
+      command: "rm -rf /var/tmp/scratch && echo 'a`b'",
+      reason: "deleting `scratch`",
+    }) as Record<string, any>;
+    expect(ok.refused).toBeUndefined();
+  });
+
+  it("redacts command-shaped secrets in the SSE event log line", async () => {
+    const secret = "evtsecret1234";
+    const logged: string[] = [];
+    const base = makeApprovalCtx({ headlessApprovalPolicy: "bridge" });
+    const ctx: AdapterExecutionContext = {
+      ...base,
+      onLog: async (_stream: string, text: string) => { logged.push(text); },
+    };
+    stubApprovalFetch({
+      interactions: () => approvalAnswer("int-1", ["deny"]),
+      events: [
+        "event: message",
+        "data: " + JSON.stringify({ detail: `run with --password ${secret} now` }),
+        "",
+        "event: run.completed",
+        'data: {"status":"completed","output":"done"}',
+        "",
+      ],
+    });
+    const result = await execute(ctx);
+    const all = logged.join("");
+    expect(all).toContain("[hermes-gateway:event]");
+    expect(all).not.toContain(secret);
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it("lets a human deny end the run on Hermes without a local stop", async () => {
+    const stub = stubApprovalFetch({
+      interactions: () => approvalAnswer("int-1", ["deny"]),
+      events: [...APPROVAL_REQUEST_EVENT, "event: run.completed", 'data: {"status":"completed","output":"done"}', ""],
+      holdEventsUntilApproved: 3,
+    });
+    const result = await execute(makeApprovalCtx({ headlessApprovalPolicy: "bridge" }));
+    // A human decision (even deny) lets Hermes end the run itself; only the
+    // unanswered/failed-bridge path stops the remote run.
+    expect(stub.approvals).toHaveLength(1);
+    expect(stub.approvals[0]).toMatchObject({ body: { choice: "deny", request_id: "approval-1" } });
+    expect(stub.stops).toHaveLength(0);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("stops and observes the remote run when an approval is never answered", async () => {
+    // headless deny: the command is refused, but the remote run must not be
+    // left live waiting on Hermes' own timer.
+    const logged: string[] = [];
+    const stub = stubApprovalFetch({ events: APPROVAL_REQUEST_EVENT });
+    void stub;
+    const base = makeApprovalCtx({});
+    const ctx: AdapterExecutionContext = {
+      ...base,
+      onLog: async (_stream: string, text: string) => { logged.push(text); },
+    };
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_approval_timeout");
+    expect(stub.stops.length).toBeGreaterThanOrEqual(1);
+    expect(result.resultJson).toMatchObject({
+      approval_request_id: "approval-1",
+      approval_denied: true,
+      approval_stop_status: "cancelled",
+    });
+    expect(result.resultJson?.approval_remote_unsettled).toBeUndefined();
+    expect(logged.join("")).toContain("stop=cancelled");
+  });
+
+  it("settles with an unresolved remote state when the stop observation never lands", async () => {
+    // /stop is refused (500) and status reads keep reporting `running`: the
+    // adapter must still settle, reporting the remote run as unsettled rather
+    // than assuming it stopped or hanging.
+    const stub = stubApprovalFetch({
+      events: [...APPROVAL_REQUEST_EVENT],
+      holdEventsUntilApproved: 99,
+      stopStatus: 500,
+      status: () => ({ status: "running" }),
+    });
+    const base = makeApprovalCtx({ headlessApprovalPolicy: "deny", approvalTimeoutSec: 15 });
+    const result = await execute(base);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_approval_timeout");
+    expect(result.resultJson).toMatchObject({
+      approval_denied: true,
+      approval_remote_unsettled: true,
+    });
+    // Every refused stop attempt is recorded (initial + bounded retry).
+    expect(stub.stops.length).toBeGreaterThanOrEqual(1);
+  }, 30_000);
+
+  it("never delivers a positive approval for a run the operator cancelled", async () => {
+    // The human answers the card "once", but the approval POST is still in
+    // flight (holdPostMs) when the operator aborts at 400ms. The positive
+    // answer never reaches Hermes (the POST aborts with the run); a protective
+    // deny is sent instead, and execute() settles cancelled (R4: no positive
+    // consent for a cancelled run).
+    const stub = stubApprovalFetch({
+      interactions: () => approvalAnswer("int-1", ["once"]),
+      events: [...APPROVAL_REQUEST_EVENT],
+      holdEventsUntilApproved: 99,
+      holdPostMs: 1_500,
+    });
+    const logged: string[] = [];
+    const controller = new AbortController();
+    const base = makeApprovalCtx({ headlessApprovalPolicy: "bridge" });
+    const ctx: AdapterExecutionContext = {
+      ...base,
+      signal: controller.signal as AbortSignal,
+      onLog: async (_stream: string, text: string) => { logged.push(text); },
+    };
+    setTimeout(() => controller.abort(), 400);
+    const result = await execute(ctx);
+    expect(result.errorCode).toBe("hermes_gateway_cancelled");
+    expect(result.resultJson?.cancelled).toBe(true);
+    // A protective deny was sent; the in-flight positive answer never completed.
+    expect(stub.approvals.some((entry) => (entry.body as Record<string, unknown>).choice === "deny")).toBe(true);
+    const joined = logged.join("");
+    expect(joined).toContain("hermes_gateway_approval_bridge_failed");
+    expect(joined).not.toContain("answered once");
+  }, 30_000);
+
+  it("settles execute() with hermes_gateway_cancelled when the operator cancels with no local timeout", async () => {
+    // timeoutSec: 0 removes the local timeout; before the cancel-settlement fix
+    // execute() hung forever here.
+    const stub = stubApprovalFetch({ events: [] });
+    const controller = new AbortController();
+    const base = makeApprovalCtx({ timeoutSec: 0, pollIntervalMs: 250 });
+    const ctx: AdapterExecutionContext = { ...base, signal: controller.signal as AbortSignal };
+    setTimeout(() => controller.abort(), 150);
+    const result = await execute(ctx);
+    expect(result).toMatchObject({
+      exitCode: 1,
+      timedOut: false,
+      errorCode: "hermes_gateway_cancelled",
+      resultJson: { cancelled: true, run_id: "run-hermes-1" },
+    });
+    expect(stub.stops.length).toBeGreaterThanOrEqual(1);
+  }, 30_000);
 });

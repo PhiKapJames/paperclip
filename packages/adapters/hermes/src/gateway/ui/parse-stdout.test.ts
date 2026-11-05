@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
 import { parseHermesGatewayStdoutLine } from "./parse-stdout.js";
 
@@ -112,5 +113,36 @@ describe("parseHermesGatewayStdoutLine — regression guards for unrelated handl
       TS,
     );
     expect(result).toEqual([{ kind: "system", ts: TS, text: "Hermes approval: run=run-1 request=approval-1 decision=once" }]);
+  });
+});
+
+describe("gateway approval markers — TypeScript and CommonJS parser parity", () => {
+  // R6 (finding #10): the published CommonJS parser must render the same
+  // approval bridge lines as the TypeScript parser.
+  const cjsParser = createRequire(import.meta.url)("../../../gateway-ui-parser.cjs") as {
+    parseStdoutLine: (line: string, ts: string) => Array<Record<string, unknown>>;
+  };
+
+  const markerLines = [
+    "[hermes-gateway:approval run=run-1 request=approval-1 waiting for a human decision]",
+    "[hermes-gateway:approval run=run-1 request=approval-1 card=int-1]",
+    "[hermes-gateway:approval run=run-1 request=approval-1 decision=once]",
+    "[hermes-gateway:approval run=run-1 request=approval-1 hermes_gateway_approval_bridge_failed]",
+    "[hermes-gateway:approval] request approval-1 already resolved (HTTP 409)",
+  ];
+
+  it.each(markerLines)("renders %s identically in both parsers", (line) => {
+    expect(cjsParser.parseStdoutLine(line, TS)).toEqual(parseHermesGatewayStdoutLine(line, TS));
+  });
+
+  it("keeps ordinary event and stdout parsing identical", () => {
+    for (const line of [
+      eventLine("message.delta", { delta: "hello" }),
+      eventLine("run.failed", { error: "boom" }),
+      "[hermes-gateway] run created: run-1",
+      "plain stdout",
+    ]) {
+      expect(cjsParser.parseStdoutLine(line, TS)).toEqual(parseHermesGatewayStdoutLine(line, TS));
+    }
   });
 });

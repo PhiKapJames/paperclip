@@ -177,28 +177,54 @@ on, so `headlessApprovalPolicy` decides what happens:
 
 - `deny` (default): the adapter answers `choice: "deny"` immediately and ends
   the run with `hermes_gateway_approval_timeout`. Nothing hangs, and nothing is
-  ever approved without a human saying so.
-- `bridge`: the adapter posts an approval card on the Paperclip issue (an
-  `ask_user_questions` interaction, rendered by the normal issue-thread card)
-  and waits for the human. The card asks one single-choice question and forwards
-  the chosen id verbatim as `{ "choice": ..., "request_id": ... }`. It offers
-  **Allow once** and **Deny** — the two choices every Hermes approval accepts —
-  plus **Allow for this run** and **Always allow** only when the
-  `approval.request` advertises them (an `allowed_choices` list). Nothing on the
-  card promises more than Hermes does: `session` only claims the current run may
-  stop re-asking, and `always` only says Hermes stores the pattern. The card is
-  `human_only`, so the
-  adapter can never answer it, and `continuationPolicy: "none"` means answering
-  does not wake a second run — the run that is already waiting picks it up.
+  approved without a human saying so.
+- `bridge`: the adapter posts an approval card on the Paperclip issue (a
+  `request_checkbox_confirmation` interaction, rendered by the normal
+  issue-thread card) and keeps observing the run while the human decides. The
+  card asks one single-selection question and forwards the chosen id verbatim
+  as `{ "choice": ..., "request_id": ... }`, plus `execution_generation` when
+  Hermes raises the approval through its session authority. The card is
+  `human_only`, so only a board user can answer it, and it sets
+  `continuationPolicy: "none"` so a reply does not queue a follow-up agent run
+  while the waiting run still holds the issue.
+
+The offered choices mirror the Hermes request: the adapter reads the canonical
+`choices` field and only ever keeps the known ids `once`, `session`, `always`
+and `deny`, with `deny` always present. The `allowed_choices` alias is
+consulted only when `choices` is absent and never widens an advertised ladder.
+When neither field is present the card offers the minimum ladder of `once` and
+`deny` - the two choices every Hermes approval accepts.
 
 Failure is always a deny: an unanswered, expired, cancelled, superseded or
-unparseable answer resolves to `deny`, and a bridge that cannot post or read the
-card fails the run instead of silently approving. Codes:
+unparseable answer resolves to `deny`, as does an answer that arrives after the
+approval deadline, and as does a positive answer for a run the operator has
+already cancelled — consent only holds while the run is live, so the cancel
+wins and a protective deny is sent instead. A bridge that cannot post or read
+the card, or cannot deliver the human's answer to Hermes, fails the run with
+`hermes_gateway_approval_bridge_failed` instead of silently approving. Only one
+approval is in flight at a time: a second approval request while the first card
+is still unanswered is refused as a bridge failure, never queued. Codes:
 `hermes_gateway_approval_timeout` (nobody answered, or the default deny policy),
 `hermes_gateway_approval_unconfigured` (`bridge` without a Paperclip API URL, a
-run access token, or an issue), `hermes_gateway_approval_bridge_failed` (Paperclip
-rejected the interaction), `hermes_gateway_approval_unparseable` (Hermes asked
-without a usable `request_id`).
+run access token, or an issue), `hermes_gateway_approval_bridge_failed`
+(Paperclip rejected the interaction, the answer could not be delivered, or a
+second request arrived while one was pending), `hermes_gateway_approval_unparseable`
+(Hermes asked without a usable `request_id`), `hermes_gateway_cancelled`
+(the operator cancelled the run, including mid-approval).
+
+A refused approval never leaves the remote run live: after any fail-closed deny
+the adapter POSTs `/stop`, retries once, and observes the run until it reports
+a terminal status (bounded by a short stop grace). What it observed is recorded
+as `approval_stop_status` in `resultJson` and `stop=` in the marker log line;
+if the stop could not be confirmed, `approval_remote_unsettled: true` says the
+remote state is unknown. A human decision — even `deny` — is different: Hermes
+ends the run on its own terms and Paperclip does not stop it locally.
+
+Card safety: a command whose text could break out of the card's Markdown fence
+(triple backticks) or inject headings is refused like an oversized one — no
+card is posted, the command is denied. Redaction applies to every log path,
+including the raw SSE event line, so command-shaped secrets never reach the
+run log.
 
 | Field | Default | Notes |
 |-------|---------|-------|
@@ -206,23 +232,51 @@ without a usable `request_id`).
 | `approvalTimeoutSec` | `300` | How long `bridge` waits for the human. Clamped to `15`…`3600`. |
 | `timeoutSec` | `600` | Hard wall for the whole run, approval wait included. |
 
-`timeoutSec` is the hard wall: the human gets
-`min(approvalTimeoutSec, time left in the run - 10s)`, and the adapter always
-denies before `timeoutSec` fires so a run never dies with a request still
-pending on the Hermes side. Interactive gateway runs routinely run far longer
-than the 600-second default, so raising `timeoutSec` well above it (and
-`approvalTimeoutSec` with it) is the normal operator setup. Keep
-`timeoutSec > approvalTimeoutSec` with room for the work that follows the
-approval — an approval budget nearly as large as the run budget leaves the
-human much less real time than the number suggests, because the wait is part of
-the run, not additional to it.
+`timeoutSec` is the hard wall. One absolute deadline -
+`min(approvalTimeoutSec, time left in the run - 10s)` - bounds every approval
+request at once: the card POST, each answer poll and the final deny, so no
+stalled HTTP call can outlive the run's budget. If the budget is already spent,
+no card is posted and the command is denied immediately. Interactive gateway
+runs routinely run far longer than the 600-second default, so raising
+`timeoutSec` well above it (and `approvalTimeoutSec` with it) is the normal
+operator setup. Keep `timeoutSec > approvalTimeoutSec` with room for the work
+that follows the approval - an approval budget nearly as large as the run
+budget leaves the human much less real time than the number suggests, because
+the wait is part of the run, not additional to it.
 
-All three fields are per-agent `hermes_gateway` configuration and none of them
-is sent to Hermes, so `approvalTimeoutSec` has to be set to the approval timeout
-the Hermes server itself is configured with (its own default is about 300s, but
-that is a Hermes-side setting Paperclip cannot read). Command text reaching the
-issue card and the run log is redacted, and the Hermes `apiKey` is never sent to
-Paperclip.
+What the human sees: the command and its reason are redacted before they reach
+the card or the run log, and the complete redacted command is always in the
+card's details - never cut down. If even the redacted content is too large for
+Paperclip's cap, the adapter refuses to present it: no card is created, the
+command is denied, and the run fails with a message saying so. A human is never
+asked to approve a command they cannot fully see. The Hermes `apiKey` is never
+sent to Paperclip.
+
+Both `approvalTimeoutSec` and the deadline live entirely in Paperclip: they are
+per-agent `hermes_gateway` fields and none of them is sent to Hermes. The known
+limits follow from that:
+
+- The final deny and the cleanup POSTs are best-effort inside a short stop
+  grace. If the Hermes API is unreachable or the deadline has passed, a deny
+  may not arrive; Hermes' own server-side approval timer is then the backstop
+  deny. When even the `/stop` observation cannot confirm a terminal state, the
+  run records `approval_remote_unsettled: true` and settles anyway — execute()
+  never hangs on an unreachable gateway.
+- A card still pending when the run has already ended cannot be cancelled by
+  the adapter. It stays in the thread, and answering it later changes nothing.
+- Because the approval card is a `request_checkbox_confirmation` with
+  `continuationPolicy: "none"`, if an agent (rather than a board user) somehow
+  accepts such a card on its own `in_review` issue, the platform's standard
+  accepted-confirmation handling can move that issue back to `todo` even though
+  this run has not finished. The adapter cannot prevent this from the adapter
+  side; approve approval cards as a board user.
+- Recovering an in-flight approval after the SSE stream drops depends on
+  `GET /v1/runs/{id}` re-publishing the pending approval (a `pending_controls`
+  entry with `prompt_id` and `execution_generation`).
+- `approvalTimeoutSec` has to be set to the approval timeout the Hermes server
+  itself is configured with (its own default is about 300s); Paperclip cannot
+  read that Hermes-side setting, and a longer `approvalTimeoutSec` does not
+  keep the request open on the Hermes side.
 
 ### Hermes-originated Paperclip tasks
 

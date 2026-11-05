@@ -3,6 +3,7 @@ import type {
   AdapterExecutionResult,
   UsageSummary,
 } from "@paperclipai/adapter-utils";
+import { redactCommandText, redactDiagnosticText } from "@paperclipai/adapter-utils";
 import type { ConnectionFailure } from "@paperclipai/adapter-utils/connection-failure";
 import {
   asNumber,
@@ -53,6 +54,8 @@ type TerminalState = {
   /** Overrides the status-derived code; used by the approval path (§5). */
   errorCode?: string | null;
   errorMessage?: string | null;
+  /** Approval-path fields merged into `resultJson` (deny landed, stop status). */
+  resultExtras?: Record<string, unknown> | null;
 };
 
 type ExecutionState = {
@@ -62,8 +65,19 @@ type ExecutionState = {
   terminal: TerminalState | null;
   resolveTerminal: (state: TerminalState) => void;
   terminalPromise: Promise<TerminalState>;
-  /** In-flight or finished human approval bridge, at most one per Hermes approval request. */
-  approvalBridge?: { requestId: string; choice: HermesApprovalChoice | null } | null;
+  /** The one Hermes approval request this run owns, with its tracked bridge (R5). */
+  approvalBridge?: ApprovalBridgeEntry | null;
+  /** In-flight approval bridges; observed (bounded) before this adapter returns. */
+  approvalTasks: Set<Promise<void>>;
+};
+
+/** A Hermes approval request this run has taken ownership of, plus its tracked bridge. */
+type ApprovalBridgeEntry = {
+  requestId: string;
+  binding: HermesApprovalBinding;
+  choice: HermesApprovalChoice | null;
+  /** Assigned synchronously at registration; settles when the human wait ends. */
+  task: Promise<void>;
 };
 
 type TextRedactor = (value: string) => string;
@@ -277,7 +291,11 @@ function createTextRedactor(secrets: Array<string | null | undefined>): TextReda
     }));
 
   return (value: string) => {
-    let result = sanitizeSensitiveText(value);
+    // Command/secret-pattern redaction runs first so generic `--password X`
+    // style material in any logged event or error is gone before it reaches a
+    // run log; exact known secrets and bearer/session patterns come after.
+    let result = redactDiagnosticText(redactCommandText(value));
+    result = sanitizeSensitiveText(result);
     for (const entry of exactSecrets) {
       result = result.replace(entry.regex, `[redacted len=${entry.secret.length}]`);
     }
@@ -352,15 +370,33 @@ function buildHeaders(input: {
 /**
  * Shared idempotency key for one Hermes approval: the same key identifies the
  * Paperclip interaction and the Hermes answer, so a retried answer is the same
- * logical request on both sides. Returns null when the key would exceed the
- * 255-char interaction limit — truncating could collide across requests.
+ * logical request on both sides. Session-authority prompts can be re-registered
+ * under the same `prompt_id` at a newer `execution_generation`, so the
+ * generation is part of the key and an old card never answers a new generation.
+ * Returns null when the key would exceed the 255-char interaction limit —
+ * truncating could collide across requests.
  */
-export function hermesApprovalKey(runId: string, requestId: string): string | null {
-  const key = `hermes-approval:${runId}:${requestId}`;
+export function hermesApprovalKey(runId: string, requestId: string, executionGeneration?: number): string | null {
+  const key = `hermes-approval:${runId}:${requestId}${executionGeneration === undefined ? "" : `:g${executionGeneration}`}`;
   return key.length <= 255 ? key : null;
 }
 
-const APPROVAL_QUESTION_ID = "decision";
+/** Two wire bindings for the same request id: equal only if protocol and generation match. */
+function sameApprovalBinding(a: HermesApprovalBinding, b: HermesApprovalBinding): boolean {
+  if (a.protocol !== b.protocol) return false;
+  return a.protocol === "legacy"
+    || (b.protocol === "session_authority" && a.executionGeneration === b.executionGeneration);
+}
+
+/** Idempotency key for a request under its wire binding (generation only exists for session authority). */
+function approvalKeyFor(runId: string, request: HermesApprovalRequest): string | null {
+  return hermesApprovalKey(
+    runId,
+    request.requestId,
+    request.binding.protocol === "session_authority" ? request.binding.executionGeneration : undefined,
+  );
+}
+
 const ALL_APPROVAL_CHOICES: Array<{ id: HermesApprovalChoice; label: string; description: string }> = [
   { id: "once", label: "Allow once", description: "Approve this command this one time." },
   {
@@ -376,65 +412,92 @@ const ALL_APPROVAL_CHOICES: Array<{ id: HermesApprovalChoice; label: string; des
 const DEFAULT_APPROVAL_CHOICE_IDS: HermesApprovalChoice[] = ["once", "deny"];
 
 /**
- * Which choices the card may offer: only what Hermes advertises on the request
- * (`allowed_choices`), so a human can never pick an option Hermes would refuse.
- * An absent or unusable advertisement falls back to the always-valid once/deny;
- * `deny` is never dropped, and an advertisement with no offerable approval
- * choice is not trusted.
+ * Human-facing approval card (§3.2 / R1 / R3). The command is redacted *here*,
+ * before any length bound is applied, so a truncation can never be the thing
+ * that removes a secret. The human sees the complete redacted command in
+ * `detailsMarkdown` (fenced, newlines preserved). If the redacted content
+ * still cannot fit the server's field limits, the card is refused outright
+ * (`refused: true`, no payload) and the caller denies — a human is never asked
+ * to approve a command they cannot fully see. `human_only` + `none` are the
+ * load-bearing fields: only a board user may answer, and answering must not
+ * queue a second agent run while this one still holds the issue. The min-one
+ * rule forces the default selection to be `deny`.
  */
-export function approvalChoiceIds(advertised: unknown): HermesApprovalChoice[] {
-  if (!Array.isArray(advertised)) return [...DEFAULT_APPROVAL_CHOICE_IDS];
-  const known = advertised.filter((value): value is HermesApprovalChoice =>
-    typeof value === "string" && ALL_APPROVAL_CHOICES.some((choice) => choice.id === value));
-  if (!known.includes("deny")) known.push("deny");
-  if (!known.some((id) => id !== "deny")) return [...DEFAULT_APPROVAL_CHOICE_IDS];
-  return known;
-}
+const APPROVAL_REFUSED_MESSAGE =
+  "The Hermes approval request could not be safely presented (content too long); the command was denied.";
 
-/**
- * Human-facing approval card (§3.2). Every field is bounded to what the server's
- * create-interaction validator accepts, and the command text arrives here already
- * redacted by the caller. `human_only` + `none` are the load-bearing fields: only
- * a board user may answer, and answering must not queue a second agent run while
- * this one still holds the issue.
- */
 export function buildApprovalInteractionBody(input: {
   key: string;
-  requestId: string;
+  /** Carried for callers' convenience (log correlation); the card itself never needs it. */
+  requestId?: string;
   command: string | null;
   reason: string | null;
   allowed?: HermesApprovalChoice[];
 }): Record<string, unknown> {
   const allowed = new Set(input.allowed ?? DEFAULT_APPROVAL_CHOICE_IDS);
-  const command = input.command?.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 1000) ?? null;
-  const reason = input.reason?.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 500) ?? null;
-  const detail = [command ? `Command: ${command}` : "Hermes did not say what it wants to run.", reason ? `Reason: ${reason}` : null]
+  // The redacted command is shown verbatim inside a fenced code block, so tab
+  // and newline survive — collapsing "\n" would hide every line but the first
+  // from the human being asked to approve. Every other C0/DEL control
+  // character is still flattened so nothing forges terminal escapes or blocks.
+  const sanitize = (text: string) =>
+    redactDiagnosticText(redactCommandText(text)).replace(/[^\P{Cc}\n\t]/gu, " ");
+  const command = input.command === null ? null : sanitize(input.command).trim();
+  const reason = input.reason === null ? null : sanitize(input.reason).trim();
+  const detail = [
+    command ? `Command:\n\n\`\`\`\n${command}\n\`\`\`` : "Hermes did not say what it wants to run.",
+    reason ? `Reason: ${reason}` : null,
+  ]
     .filter(Boolean)
-    .join("\n");
-  // `summary` and the question `prompt` are what the card renders; this interaction
-  // kind has no top-level `message` field, so one would be silently stripped.
-  const prompt = `Hermes wants to run a command. Approve or deny.\n\n${detail}`.slice(0, 4000);
+    .join("\n\n");
+  // A command containing triple backticks could close its own fence and forge
+  // extra card content, and a line starting with `#` would render as a heading.
+  // Refuse the card outright (the caller then denies) rather than show content
+  // whose Markdown boundaries the remote side controls.
+  // Indented fences are equally unsafe, but leading whitespace before a heading
+  // is harmless, so only the backticks are matched without an anchor.
+  const fenceUnsafe =
+    (command !== null && command.includes("```")) ||
+    /^#{1,6}\s/m.test(command ?? "") ||
+    /^#{1,6}\s/m.test(reason ?? "");
+  if (fenceUnsafe || detail.length > 20000) {
+    // Over the server cap (or unsafe Markdown): refuse rather than truncate or
+    // misrender a command a human is being asked to approve. The caller denies
+    // and never creates a card.
+    return {
+      kind: "request_checkbox_confirmation",
+      idempotencyKey: input.key,
+      title: "Hermes approval requested",
+      summary: APPROVAL_REFUSED_MESSAGE,
+      refused: true,
+    };
+  }
+  // Only id/label/description are accepted on an option; the default selection
+  // is carried by defaultSelectedOptionIds, not a per-option flag.
+  const options = ALL_APPROVAL_CHOICES.filter((choice) => allowed.has(choice.id)).map((choice) => ({
+    id: choice.id,
+    label: choice.label,
+    description: choice.description,
+  }));
   return {
-    kind: "ask_user_questions",
+    kind: "request_checkbox_confirmation",
     idempotencyKey: input.key,
-    title: `Hermes approval: ${command ?? input.requestId}`.slice(0, 240),
-    summary: detail.slice(0, 1000),
+    title: `Hermes approval requested: ${command ?? "unspecified command"}`.replace(/\s+/g, " ").trim().slice(0, 240),
+    // `summary` is a one-line preview; the complete redacted command is always in
+    // `detailsMarkdown`, which is why this preview may be cut.
+    summary: detail.replace(/\s+/g, " ").trim().slice(0, 900),
     resolverPolicy: "human_only",
     continuationPolicy: "none",
     payload: {
       version: 1,
+      prompt: "Hermes asked to run a command. Select exactly one decision and submit.",
       supersedeOnUserComment: false,
-      runtimeRequestId: input.requestId,
-      questions: [
-        {
-          id: APPROVAL_QUESTION_ID,
-          prompt,
-          selectionMode: "single",
-          required: true,
-          allowOther: false,
-          options: ALL_APPROVAL_CHOICES.filter((choice) => allowed.has(choice.id)),
-        },
-      ],
+      options,
+      defaultSelectedOptionIds: ["deny"],
+      minSelected: 1,
+      maxSelected: 1,
+      acceptLabel: "Submit decision",
+      rejectLabel: "Deny",
+      detailsMarkdown: detail,
     },
   };
 }
@@ -480,17 +543,23 @@ export async function postApproval(input: {
   headers: Record<string, string>;
   runId: string;
   key: string;
-  requestId: string;
+  request: HermesApprovalRequest;
   choice: HermesApprovalChoice;
   signal: AbortSignal;
   onLog: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
 }): Promise<boolean> {
+  // Session-authority replies must carry exactly {request_id, execution_generation, choice}
+  // (api_server.py `respond_run`); legacy replies carry {choice, request_id}.
+  const { binding } = input.request;
+  const body = binding.protocol === "session_authority"
+    ? { choice: input.choice, request_id: input.request.requestId, execution_generation: binding.executionGeneration }
+    : { choice: input.choice, request_id: input.request.requestId };
   let response: Response;
   try {
     response = await fetch(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/approval`), {
       method: "POST",
       headers: { ...input.headers, "Content-Type": "application/json", "Idempotency-Key": input.key },
-      body: JSON.stringify({ choice: input.choice, request_id: input.requestId }),
+      body: JSON.stringify(body),
       signal: input.signal,
     });
   } catch (err) {
@@ -499,11 +568,11 @@ export async function postApproval(input: {
     return false;
   }
   if (response.ok) {
-    await input.onLog("stdout", `[hermes-gateway:approval] answered ${input.choice} for ${input.requestId}\n`);
+    await input.onLog("stdout", `[hermes-gateway:approval] answered ${input.choice} for ${input.request.requestId}\n`);
     return true;
   }
   if (response.status === 409) {
-    await input.onLog("stdout", `[hermes-gateway:approval] request ${input.requestId} already resolved (HTTP 409)\n`);
+    await input.onLog("stdout", `[hermes-gateway:approval] request ${input.request.requestId} already resolved (HTTP 409)\n`);
     return true;
   }
   await input.onLog("stderr", `[hermes-gateway:approval] answer rejected (HTTP ${response.status})\n`);
@@ -705,6 +774,7 @@ function createExecutionState(runId: string): ExecutionState {
     terminal: null,
     resolveTerminal,
     terminalPromise,
+    approvalTasks: new Set(),
   };
 }
 
@@ -733,8 +803,25 @@ function extractOutput(value: unknown): string | null {
   return nested ? extractOutput(nested) : null;
 }
 
+/**
+ * Which Hermes approval protocol a request uses (§ plan R2). Pinned upstream
+ * Hermes 7b55a7c2363610cb3622f87ed66dcea18720bde6.
+ * - `legacy`: `approval.request` frames carry `request_id`; the reply body is
+ *   `{choice, request_id}` (api_server.py `_approval_request_event`).
+ * - `session_authority`: `PendingControls.register` events carry `prompt_id`
+ *   plus an int `execution_generation`; the reply body must contain exactly
+ *   `{request_id, execution_generation, choice}` — the generation is what
+ *   makes a stale reply fail with `stale_generation`
+ *   (session_pending_controls.py, api_server.py `respond_run`).
+ */
+export type HermesApprovalBinding =
+  | { protocol: "legacy" }
+  | { protocol: "session_authority"; executionGeneration: number };
+
 export type HermesApprovalRequest = {
   requestId: string;
+  /** Wire binding: which reply body this request accepts and its replay guard. */
+  binding: HermesApprovalBinding;
   command: string | null;
   reason: string | null;
   /** Choices this request permits on the card; never empty, always includes `deny`. */
@@ -743,15 +830,62 @@ export type HermesApprovalRequest = {
 
 const APPROVAL_WAIT_STATUSES = new Set(["waiting_for_approval", "awaiting_approval", "requires_approval", "pending_approval"]);
 
+/**
+ * Reads the canonical `choices` ladder advertised by Hermes (pinned upstream
+ * 7b55a7c236: `_approval_event_choices` and `PendingControls.register` both
+ * publish `choices`). Aliases are considered ONLY when `choices` is absent,
+ * so a canonical ladder is never widened. `once`/`deny` are always present
+ * upstream, so the fallback is the minimum ladder, never a wider one.
+ */
+function parseApprovalChoices(...values: Array<unknown>): HermesApprovalChoice[] {
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    if (!Array.isArray(value)) return ["once", "deny"];
+    const parsed: HermesApprovalChoice[] = [];
+    for (const entry of value) {
+      if (entry === "once" || entry === "session" || entry === "always" || entry === "deny") {
+        if (!parsed.includes(entry)) parsed.push(entry);
+      }
+    }
+    if (parsed.length === 0) return ["once", "deny"];
+    if (!parsed.includes("deny")) parsed.push("deny");
+    return parsed;
+  }
+  return ["once", "deny"];
+}
+
+/** Hermes' session-authority generation must be a non-negative safe int; anything else is unusable. */
+function approvalGeneration(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return null;
+  return value;
+}
+
 function approvalFields(record: Record<string, unknown> | null, depth = 0): HermesApprovalRequest | null {
   if (!record || depth > MAX_APPROVAL_NESTING) return null;
+  // Session-authority protocol: `prompt_id` + int `execution_generation` only.
+  // Never guess or reuse a generation from another frame or control.
+  const promptId = nonEmpty(record.prompt_id);
+  if (promptId) {
+    const generation = approvalGeneration(record.execution_generation);
+    if (generation === null) return null;
+    return {
+      requestId: promptId,
+      binding: { protocol: "session_authority", executionGeneration: generation },
+      command: nonEmpty(record.command) ?? nonEmpty(record.command_line) ?? nonEmpty(record.cmd),
+      reason: nonEmpty(record.reason) ?? nonEmpty(record.description) ?? nonEmpty(record.message),
+      allowed: parseApprovalChoices(record.choices, record.allowed_choices, record.allowedChoices),
+    };
+  }
+  // Legacy protocol: `request_id`. An accompanying `execution_generation` is
+  // ignored upstream (`_approval_request_event`), so the reply stays legacy.
   const requestId = nonEmpty(record.request_id) ?? nonEmpty(record.requestId);
   if (requestId) {
     return {
       requestId,
+      binding: { protocol: "legacy" },
       command: nonEmpty(record.command) ?? nonEmpty(record.command_line) ?? nonEmpty(record.cmd),
       reason: nonEmpty(record.reason) ?? nonEmpty(record.description) ?? nonEmpty(record.message),
-      allowed: approvalChoiceIds(record.allowed_choices ?? record.allowedChoices),
+      allowed: parseApprovalChoices(record.choices, record.allowed_choices, record.allowedChoices),
     };
   }
   const nested = asRecord(record.data) ?? asRecord(record.payload);
@@ -765,10 +899,15 @@ export function extractApprovalRequest(value: unknown, fallbackEventName: string
   // The SSE frame name is not repeated inside `data`, so callers pass it as a fallback.
   const eventName = eventNameFromData(record, fallbackEventName);
   const nested = asRecord(record.data) ?? asRecord(record.payload);
-  const nestedIsApproval = nested !== null
-    && (isApprovalRequestEvent(eventNameFromData(nested, null))
-      || APPROVAL_WAIT_STATUSES.has(extractStatus(nested) ?? ""));
-  if (!isApprovalRequestEvent(eventName) && !nestedIsApproval) {
+  // A frame whose own payload names the approval event is the same frame with
+  // the SSE name carried inside `data` instead of on the frame.
+  const namesApproval = isApprovalRequestEvent(eventName)
+    || isApprovalRequestEvent(eventNameFromData(nested, null));
+  // Session-authority registers arrive under the same `approval.request` event
+  // name with `kind: "approval"` in the payload (session_pending_controls.py
+  // `register`). A frame with none of these markers is some other event and must
+  // never reach approvalFields, which accepts any `request_id`/`prompt_id`.
+  if (!namesApproval && record.kind !== "approval" && nested?.kind !== "approval") {
     return null;
   }
   return approvalFields(record);
@@ -777,13 +916,31 @@ export function extractApprovalRequest(value: unknown, fallbackEventName: string
 export type HermesApprovalChoice = "once" | "session" | "always" | "deny";
 
 /**
- * Maps a Paperclip `ask_user_questions` interaction onto a Hermes approval choice.
- * Fail-closed: anything other than exactly one known option on the `decision`
- * question resolves to "deny". Never infers consent.
+ * Maps a resolved Paperclip approval interaction onto a Hermes approval choice.
+ * Accepts the checkbox-confirmation result (`status:"accepted"` +
+ * `result.outcome` + `result.selectedOptionIds`) and the legacy
+ * ask_user_questions `answers` shape.
+ * Fail-closed: anything other than exactly one known option resolves to "deny".
+ * Never infers consent.
  */
 export function resolveHermesApprovalChoice(interaction: unknown): HermesApprovalChoice {
   const record = asRecord(interaction);
   if (!record) return "deny";
+
+  // request_checkbox_confirmation: only an accepted outcome with exactly one
+  // known selected option id is a human decision; every other terminal status
+  // (rejected, superseded, withdrawn, cancelled, expired, closed) denies.
+  if (record.status === "accepted") {
+    const result = asRecord(record.result);
+    if (!result || result.outcome !== "accepted") return "deny";
+    const selected = result.selectedOptionIds;
+    if (!Array.isArray(selected) || selected.length !== 1) return "deny";
+    const choice = selected[0];
+    return choice === "once" || choice === "session" || choice === "always" || choice === "deny"
+      ? choice
+      : "deny";
+  }
+
   if (record.status !== "answered") return "deny";
 
   const result = asRecord(record.result);
@@ -816,7 +973,14 @@ export function resolveHermesApprovalChoice(interaction: unknown): HermesApprova
     : "deny";
 }
 
-/** Tolerant probe of a `GET /v1/runs/{id}` body for an approval still awaiting an answer. */
+/**
+ * Tolerant probe of a `GET /v1/runs/{id}` body for an approval still awaiting an answer.
+ * Session-authority runs publish `pending_controls` (session_pending_controls.py
+ * `project` / api_server.py `run_projection`); each control pairs its own
+ * `prompt_id`+`execution_generation` with the snapshot's top-level
+ * `execution_generation`, and only controls matching that snapshot generation
+ * are still pending.
+ */
 export function extractPendingApproval(value: unknown): HermesApprovalRequest | null {
   const record = asRecord(value);
   if (!record) return null;
@@ -828,6 +992,21 @@ export function extractPendingApproval(value: unknown): HermesApprovalRequest | 
     const pending = asRecord(container.pending_approval) ?? asRecord(container.approval_request);
     const single = approvalFields(pending) ?? approvalFields(approvals);
     if (single) return single;
+    const controls = container.pending_controls;
+    if (Array.isArray(controls)) {
+      // Pair each control with the snapshot generation exactly as upstream's
+      // projection does; never reuse another control's generation.
+      const snapshotGeneration = approvalGeneration(container.execution_generation);
+      for (const entry of controls) {
+        const control = asRecord(entry);
+        if (!control || control.kind !== "approval") continue;
+        const generation = approvalGeneration(control.execution_generation) ?? snapshotGeneration;
+        if (generation === null) continue;
+        if (snapshotGeneration !== null && generation !== snapshotGeneration) continue;
+        const found = approvalFields({ ...control, execution_generation: generation });
+        if (found) return found;
+      }
+    }
     const list = approvals?.pending ?? approvals?.requests ?? approvals?.pending_approvals;
     if (Array.isArray(list)) {
       for (const entry of list) {
@@ -847,11 +1026,15 @@ export function extractPendingApproval(value: unknown): HermesApprovalRequest | 
   return null;
 }
 
+/** Per-call ceiling for post-settlement status/stop reads, so a stalled
+ * connection can never outlive the STOP_GRACE_MS observation window. */
+const FINAL_STATUS_READ_TIMEOUT_MS = 3_000;
 const APPROVAL_POLL_INTERVAL_MS = 2_000;
 const APPROVAL_DENY_MARGIN_MS = STOP_GRACE_MS;
 const APPROVAL_BRIDGE_UNAVAILABLE = "hermes_gateway_approval_unconfigured";
 const APPROVAL_BRIDGE_FAILED = "hermes_gateway_approval_bridge_failed";
 const APPROVAL_TIMED_OUT = "hermes_gateway_approval_timeout";
+const APPROVAL_RUN_CANCELLED = "hermes_gateway_cancelled";
 
 /** Why a bridge could not deliver a human answer, when there was no human answer to make. */
 type BridgeFailure = { code: string; message: string };
@@ -882,26 +1065,47 @@ async function failApproval(
   ctx: AdapterExecutionContext,
   state: ExecutionState,
   approval: HandleEventApproval,
-  requestId: string | null,
+  request: HermesApprovalRequest | null,
   code: string,
   message: string,
   redactText: TextRedactor,
 ): Promise<void> {
-  const key = requestId ? hermesApprovalKey(state.runId, requestId) : null;
-  if (requestId && key) {
-    await postApproval({
+  const requestId = request?.requestId ?? null;
+  const key = request ? approvalKeyFor(state.runId, request) : null;
+  // An over-cap idempotency key means Hermes can never be told; the log must say
+  // so, because the run then settles only on Hermes' own approval timer.
+  const denyNote = request && !key ? " deny=skipped" : "";
+  let denied = false;
+  if (request && key) {
+    denied = await postApproval({
       baseUrl: approval.baseUrl,
       headers: approval.headers,
       runId: state.runId,
       key,
-      requestId,
+      request,
       choice: "deny",
-      signal: approval.signal,
+      // The deny must land even after the run signal expired or was aborted (R4).
+      signal: cleanupSignal(),
       onLog: ctx.onLog,
     });
   }
+  // A deny only refuses the *command*. Hermes may go on with the turn (legacy
+  // semantics) or keep the run in `waiting_for_approval` (authority semantics),
+  // and an unanswered request must never leave a live run behind just because
+  // this Paperclip run reports a failure. Stop it and observe the terminal state
+  // within a bounded window; an unsettled remote run stays visible as `unknown`.
+  await stopRun({ ctx, baseUrl: approval.baseUrl, headers: approval.headers, runId: state.runId, redactText, retryOnce: true });
+  const finalStatus = await fetchFinalStatus({
+    baseUrl: approval.baseUrl,
+    headers: approval.headers,
+    runId: state.runId,
+    deadlineMs: STOP_GRACE_MS,
+  });
+  // The Paperclip run settles here regardless: an unconfirmed stop is reported
+  // as `unknown` in stop= and resultJson rather than hanging execute().
+  const remoteUnsettled = finalStatus === null || !TERMINAL_STATUSES.has(extractStatus(finalStatus) ?? "");
   const logMessage = redactText(message);
-  await ctx.onLog("stderr", `[${APPROVAL_MARKER} run=${state.runId} request=${requestId ?? "unknown"} ${code}]\n`);
+  await ctx.onLog("stderr", `[${APPROVAL_MARKER} run=${state.runId} request=${requestId ?? "unknown"} ${code}${denyNote} stop=${extractStatus(finalStatus) ?? "unknown"}]\n`);
   markTerminal(state, {
     runId: state.runId,
     status: "failed",
@@ -910,6 +1114,12 @@ async function failApproval(
     output: null,
     errorCode: code,
     errorMessage: logMessage,
+    resultExtras: {
+      approval_request_id: requestId,
+      approval_denied: denied,
+      approval_stop_status: extractStatus(finalStatus) ?? "unknown",
+      ...(remoteUnsettled ? { approval_remote_unsettled: true } : {}),
+    },
   });
 }
 
@@ -920,14 +1130,42 @@ function remainingRunMs(deadlineMs: number, nowMs: () => number): number | null 
 }
 
 /**
- * The approval wait budget (§3.3): never past the run deadline and never inside the margin the
- * run still needs to stop cleanly. `timeoutSec` stays the hard wall — an unanswered approval
- * cannot extend a run.
+ * One absolute approval deadline (§3.3, R4): the earlier of the approval timeout and the run
+ * deadline minus the margin the run still needs to stop cleanly. Every awaited approval call —
+ * the card POST, each status read and its body — is cut off here, so no stalled HTTP call can
+ * outlive the budget. `timeoutSec` stays the hard wall; `timeoutSec: 0` removes only the run
+ * deadline, never the bound on the approval wait itself.
  */
-function approvalBudgetMs(input: { approvalTimeoutMs: number; deadlineMs: number; nowMs: () => number }): number {
-  const remaining = remainingRunMs(input.deadlineMs, input.nowMs);
-  if (remaining === null) return 0;
-  return Math.max(0, Math.min(input.approvalTimeoutMs, remaining - APPROVAL_DENY_MARGIN_MS));
+function approvalDeadlineMs(input: { approvalTimeoutMs: number; deadlineMs: number; nowMs: () => number }): number {
+  return Math.min(input.nowMs() + input.approvalTimeoutMs, input.deadlineMs - APPROVAL_DENY_MARGIN_MS);
+}
+
+/**
+ * Observes tracked approval work for at most STOP_GRACE_MS. True when everything settled;
+ * false is the boundary gap (a bridge still in flight), which the caller must report rather
+ * than pretend completed.
+ *
+ * shortcut: the set is snapshotted once, so a bridge registered after this point is not
+ * waited on. In practice nothing registers after execute() has aborted, since both the SSE
+ * reader and the status poller stop on the run signal.
+ */
+async function drainApprovalTasks(state: ExecutionState): Promise<boolean> {
+  const tasks = [...state.approvalTasks];
+  if (tasks.length === 0) return true;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const drained = await Promise.race([
+    Promise.allSettled(tasks).then(() => true),
+    new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), STOP_GRACE_MS);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  return drained;
+}
+
+/** Cleanup (the reply to Hermes) gets its own bounded window, never an already-expired signal. */
+function cleanupSignal(): AbortSignal {
+  return AbortSignal.timeout(STOP_GRACE_MS);
 }
 
 /**
@@ -941,12 +1179,13 @@ async function pollForApprovalAnswer(input: {
   issueId: string;
   interactionId: string;
   idempotencyKey: string;
-  budgetMs: number;
+  /** Absolute deadline shared with the card POST (R4); a reply after it is never forwarded. */
+  deadlineMs: number;
   signal: AbortSignal;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<unknown>;
   nowMs: () => number;
 }): Promise<{ choice: HermesApprovalChoice; answered: boolean }> {
-  const deadline = input.nowMs() + input.budgetMs;
+  const deadline = input.deadlineMs;
   // A human decision and a non-decision both deny, but only a human decision may let the run
   // keep streaming; report the difference so an unanswered approval fails the run (§3.3).
   const unanswered = { choice: "deny" as const, answered: false };
@@ -957,7 +1196,7 @@ async function pollForApprovalAnswer(input: {
     ).toString();
     let response: Response | null = null;
     try {
-      response = await fetch(`${interactionUrl.toString()}?limit=100`, {
+      response = await fetch(interactionUrl.toString(), {
         method: "GET",
         headers: {
           Accept: "application/json",
@@ -1036,7 +1275,6 @@ async function pollForApprovalAnswer(input: {
 async function runApprovalBridge(input: {
   ctx: AdapterExecutionContext;
   state: ExecutionState;
-  requestId: string;
   approval: HermesApprovalRequest;
   baseUrl: URL;
   headers: Record<string, string>;
@@ -1059,7 +1297,32 @@ async function runApprovalBridge(input: {
       },
     };
   }
-  const key = hermesApprovalKey(input.ctx.runId, input.requestId);
+  // R4: one absolute deadline covers every awaited approval call. With no time left
+  // we refuse without creating a card or making even one request.
+  const approvalDeadline = approvalDeadlineMs({
+    approvalTimeoutMs: input.approvalTimeoutMs,
+    deadlineMs: input.deadlineMs,
+    nowMs: input.nowMs,
+  });
+  if (approvalDeadline <= input.nowMs()) {
+    return {
+      choice: "deny",
+      answered: false,
+      failure: {
+        code: APPROVAL_TIMED_OUT,
+        message: "There is no time left in this run to wait for an approval, so the command was denied.",
+      },
+    };
+  }
+  // shortcut: this timeout signal lives until it fires even after the bridge
+  // returns (AbortSignal.any keeps a reference to it). Harmless for the bounded
+  // approvalTimeoutSec window; upgrade if the bridge ever outlives a long budget.
+  const signal = AbortSignal.any([
+    input.signal,
+    AbortSignal.timeout(Math.max(1, approvalDeadline - input.nowMs())),
+  ]);
+
+  const key = approvalKeyFor(input.ctx.runId, input.approval);
   if (!key) {
     return {
       choice: "deny",
@@ -1071,28 +1334,37 @@ async function runApprovalBridge(input: {
     };
   }
 
+  // Redact exact known credentials first, then hand off to the card builder,
+  // which applies generic secret redaction before any length bound (R3).
+  const body = buildApprovalInteractionBody({
+    key,
+    command: input.approval.command === null ? null : input.redactText(input.approval.command),
+    reason: input.approval.reason === null ? null : input.redactText(input.approval.reason),
+    allowed: input.approval.allowed,
+  });
+
   let interactionId: string | null = null;
   try {
+    if (body.refused === true) {
+      // The command could not be fully presented to a human; deny without
+      // creating a card, but still tell Hermes so the run cannot hang.
+      throw new Error(String(body.summary));
+    }
     ({ interactionId } = await createApprovalInteraction({
       paperclipApiUrl,
       authToken,
       runId: input.ctx.runId,
       issueId,
-      body: buildApprovalInteractionBody({
-        key,
-        requestId: input.requestId,
-        command: input.approval.command === null ? null : input.redactText(input.approval.command),
-        reason: input.approval.reason === null ? null : input.redactText(input.approval.reason),
-        allowed: input.approval.allowed,
-      }),
-      signal: input.signal,
+      body,
+      signal,
     }));
   } catch (err) {
     return {
       choice: "deny",
       answered: false,
       failure: {
-        code: APPROVAL_BRIDGE_FAILED,
+        // An operator stop is a cancelled run, not a broken bridge (R4).
+        code: input.signal.aborted ? APPROVAL_RUN_CANCELLED : APPROVAL_BRIDGE_FAILED,
         message: err instanceof Error ? err.message : "Paperclip rejected the approval request.",
       },
     };
@@ -1101,32 +1373,74 @@ async function runApprovalBridge(input: {
   // A response that never arrives is answered with a deny; the SSE stream stays alive (§3.1).
   await input.ctx.onLog(
     "stdout",
-    `[${APPROVAL_MARKER} run=${input.state.runId} request=${input.requestId} card=${interactionId ?? "unknown"}]\n`,
+    `[${APPROVAL_MARKER} run=${input.state.runId} request=${input.approval.requestId} card=${interactionId ?? "unknown"}]\n`,
   );
 
-  const { choice, answered } = await pollForApprovalAnswer({
+  const decision = await pollForApprovalAnswer({
     paperclipApiUrl,
     authorizationHeaderValue: `Bearer ${authToken}`,
     runId: input.ctx.runId,
     issueId,
     interactionId: interactionId ?? "",
     idempotencyKey: key,
-    budgetMs: approvalBudgetMs({ approvalTimeoutMs: input.approvalTimeoutMs, deadlineMs: input.deadlineMs, nowMs: input.nowMs }),
-    signal: input.signal,
+    deadlineMs: approvalDeadline,
+    signal,
     onLog: input.ctx.onLog,
     nowMs: input.nowMs,
   });
+  // Consent that arrives at or after the deadline is never forwarded to Hermes (R4).
+  const answered = decision.answered && input.nowMs() < approvalDeadline;
+  const choice = answered ? decision.choice : "deny";
 
-  await postApproval({
+  // A positive decision is consent that only holds while the run is still live.
+  // If the operator cancelled (or the wait budget expired) while the human was
+  // deciding, the cancel wins: never hand Hermes a "run it" after a stop. Only
+  // the deny side may use the cleanup window, because refusing is always safe.
+  if (choice !== "deny" && signal.aborted) {
+    return {
+      choice: "deny",
+      answered: false,
+      failure: {
+        code: APPROVAL_RUN_CANCELLED,
+        message: "The run was cancelled before the approval decision could be delivered.",
+      },
+    };
+  }
+
+  const delivered = await postApproval({
     baseUrl: input.baseUrl,
     headers: input.headers,
     runId: input.state.runId,
-    requestId: input.requestId,
+    request: input.approval,
     key,
     choice,
-    signal: input.signal,
+    // A deny must land even when the run signal is already aborted; it gets its
+    // own bounded window (R4). A positive answer requires the live run signal.
+    signal: choice === "deny" ? cleanupSignal() : signal,
     onLog: input.ctx.onLog,
   });
+  if (!answered && choice === "deny" && !delivered && input.signal.aborted) {
+    // The run was cancelled and even the protective deny never reached Hermes:
+    // report the cancellation rather than a generic bridge failure. The caller
+    // still stops and observes the remote run.
+    return {
+      choice: "deny",
+      answered: false,
+      failure: {
+        code: APPROVAL_RUN_CANCELLED,
+        message: "The run was cancelled and the protective deny could not be delivered to Hermes.",
+      },
+    };
+  }
+  if (answered && !delivered) {
+    // A human decided but Hermes never accepted the answer: the remote run is still
+    // blocked, so record the transport failure instead of streaming on forever (R5).
+    return {
+      choice: "deny",
+      answered: false,
+      failure: { code: APPROVAL_BRIDGE_FAILED, message: "Hermes did not accept the approval answer." },
+    };
+  }
 
   return { choice, answered, failure: null };
 }
@@ -1181,15 +1495,18 @@ async function handleEvent(
     await failApproval(ctx, state, approval, null, APPROVAL_UNPARSEABLE, "Hermes requested approval without a usable request_id.", redactText);
     return;
   }
-  await bridgeApprovalRequest(ctx, state, approval, request, redactText, eventName, record);
+  // R5: registering must never block observation; the bridge is tracked work.
+  void bridgeApprovalRequest(ctx, state, approval, request, redactText, eventName, record);
 }
 
 /**
- * Handles one Hermes approval request: deny it outright, or bridge it to a human on the
- * Paperclip issue. Deduped by request_id so an SSE replay or a status poll of a run that is
- * still waiting cannot start a second bridge.
+ * Takes ownership of one Hermes approval request WITHOUT blocking observation (R5). The
+ * bridge runs as tracked work on the execution state so the SSE stream, status polling and
+ * cancellation all stay live for the whole human wait; the returned promise is that
+ * tracked work. Dedupe is bound to request AND generation: a session-authority prompt
+ * re-registered at a newer generation is a new request, never a replay.
  */
-async function bridgeApprovalRequest(
+function bridgeApprovalRequest(
   ctx: AdapterExecutionContext,
   state: ExecutionState,
   approval: HandleEventApproval,
@@ -1198,18 +1515,74 @@ async function bridgeApprovalRequest(
   eventName: string | null,
   payload: Record<string, unknown> | null,
 ): Promise<void> {
-  if (state.approvalBridge?.requestId === request.requestId) return;
+  const existing = state.approvalBridge;
+  if (existing && existing.requestId === request.requestId && sameApprovalBinding(existing.binding, request.binding)) {
+    // An SSE replay or a status poll rediscovering the same request must never raise a
+    // second card or a second answer; the work already in flight owns it.
+    return existing.task;
+  }
+  if (existing && existing.choice === null) {
+    // One approval per run is in flight and unanswered: a second request cannot be
+    // queued behind it (Hermes only has one pending approval), so refuse it outright
+    // rather than let it sit unanswered (fail closed).
+    const busyTask = failApproval(
+      ctx,
+      state,
+      approval,
+      request,
+      APPROVAL_BRIDGE_FAILED,
+      "Hermes requested a second approval while another approval was still unanswered.",
+      redactText,
+    ).finally(() => {
+      state.approvalTasks.delete(busyTask);
+    });
+    // The in-flight approval keeps ownership of state.approvalBridge; this refusal
+    // is only tracked so settlement still waits on its deny POST.
+    state.approvalTasks.add(busyTask);
+    return busyTask;
+  }
 
+  const task = runApprovalBridgeRequest(ctx, state, approval, request, redactText, eventName, payload)
+    .catch(async (err: unknown) => {
+      // Fail closed: a bridge that died unexpectedly still has to refuse the run, never
+      // leave Hermes waiting on a human nobody is representing.
+      await failApproval(
+        ctx,
+        state,
+        approval,
+        request,
+        APPROVAL_BRIDGE_FAILED,
+        err instanceof Error ? err.message : String(err),
+        redactText,
+      ).catch(() => undefined);
+    })
+    .finally(() => {
+      state.approvalTasks.delete(task);
+    });
+  state.approvalBridge = { requestId: request.requestId, binding: request.binding, choice: null, task };
+  state.approvalTasks.add(task);
+  return task;
+}
+
+/** The tracked work behind one approval: outright deny, or the human bridge and its outcome. */
+async function runApprovalBridgeRequest(
+  ctx: AdapterExecutionContext,
+  state: ExecutionState,
+  approval: HandleEventApproval,
+  request: HermesApprovalRequest,
+  redactText: TextRedactor,
+  eventName: string | null,
+  payload: Record<string, unknown> | null,
+): Promise<void> {
   if (approval.config.policy === "deny") {
     // Default policy: refuse immediately so Hermes never blocks on a human who is not there.
-    await failApproval(ctx, state, approval, request.requestId, APPROVAL_TIMED_OUT, "Hermes requested approval, but this adapter is headless (headlessApprovalPolicy=deny).", redactText);
+    await failApproval(ctx, state, approval, request, APPROVAL_TIMED_OUT, "Hermes requested approval, but this adapter is headless (headlessApprovalPolicy=deny).", redactText);
     return;
   }
 
   const bridge = runApprovalBridge({
     ctx,
     state,
-    requestId: request.requestId,
     approval: request,
     baseUrl: approval.baseUrl,
     headers: approval.headers,
@@ -1219,7 +1592,6 @@ async function bridgeApprovalRequest(
     redactText,
     nowMs: approval.now,
   });
-  state.approvalBridge = { requestId: request.requestId, choice: null };
   await ctx.onLog("stdout", `[${APPROVAL_MARKER} run=${state.runId} request=${request.requestId} waiting for a human decision]\n`);
 
   const { choice, answered, failure } = await bridge;
@@ -1227,7 +1599,7 @@ async function bridgeApprovalRequest(
   if (failure) {
     // A bridge that could not run at all still has to refuse the Hermes run, otherwise Hermes
     // waits out its own approval timer with nobody able to answer.
-    await failApproval(ctx, state, approval, request.requestId, failure.code, failure.message, redactText);
+    await failApproval(ctx, state, approval, request, failure.code, failure.message, redactText);
     return;
   }
   // A human decision (even "deny") lets Hermes end the run on its own terms; an approval that
@@ -1237,6 +1609,10 @@ async function bridgeApprovalRequest(
     message: "Hermes requested approval and the deny was sent, but no human decision was received.",
   };
   if (terminalFailure) {
+    await ctx.onLog(
+      "stderr",
+      `[${APPROVAL_MARKER} run=${state.runId} request=${request.requestId} unanswered approval denied]\n`,
+    );
     markTerminal(state, {
       runId: state.runId,
       status: "failed",
@@ -1302,7 +1678,7 @@ async function pollStatus(input: {
       // bridgeApprovalRequest dedupes by request_id, so this never raises a second card.
       const pending = extractPendingApproval(status);
       if (pending) {
-        await bridgeApprovalRequest(input.ctx, input.state, input.approval, pending, redactText, "run.status", asRecord(status));
+        void bridgeApprovalRequest(input.ctx, input.state, input.approval, pending, redactText, "run.status", asRecord(status));
       }
     } catch (err) {
       if (input.signal.aborted) return;
@@ -1434,7 +1810,11 @@ export function mapFinalResultForTest(input: {
   const usage = parseUsage(payload);
   const costUsd = parseCostUsd(payload);
   const errorMessage = mapped.errorCode
-    ? redactText(extractErrorMessage(payload) ?? `Hermes run ${input.terminal.status}`)
+    ? redactText(
+        input.terminal.errorMessage ??
+          extractErrorMessage(payload) ??
+          `Hermes run ${input.terminal.status}`,
+      )
     : null;
   return {
     exitCode: mapped.exitCode,
@@ -1462,6 +1842,7 @@ export function mapFinalResultForTest(input: {
       output: output ?? "",
       usage: usage ?? null,
       cost_usd: costUsd,
+      ...(input.terminal.resultExtras ?? {}),
     },
   };
 }
@@ -1472,20 +1853,71 @@ async function stopRun(input: {
   headers: Record<string, string>;
   runId: string;
   redactText?: TextRedactor;
+  /** When the stop is refused, retry it ONCE; each attempt is bounded. */
+  retryOnce?: boolean;
+}): Promise<Record<string, unknown> | null> {
+  const stop = async () => {
+    try {
+      // The stop fetch is raced with its own bounded timer: a stalled
+      // (non-abortable) request can never outlive the settlement window.
+      const stopped = await Promise.race([
+        fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/stop`), {
+          method: "POST",
+          headers: input.headers,
+          signal: AbortSignal.timeout(FINAL_STATUS_READ_TIMEOUT_MS),
+        }),
+        new Promise((resolve) => setTimeout(() => resolve(undefined), FINAL_STATUS_READ_TIMEOUT_MS)),
+      ]);
+      if (stopped === undefined) throw new Error("stop request timed out");
+      await input.ctx.onLog("stdout", `[hermes-gateway] stop requested for run ${input.runId}\n`);
+      return asRecord(stopped);
+    } catch (err) {
+      await input.ctx.onLog("stderr", `[hermes-gateway] stop request failed: ${redactErrorMessage(err, input.redactText)}\n`);
+      return null;
+    }
+  };
+  const first = await stop();
+  if (first !== null || !input.retryOnce) return first;
+  // A refused stop means Hermes never accepted it — one retry before the
+  // outcome is observed; an unconfirmed stop is reported, never assumed.
+  return await stop();
+}
+
+/** Reads one run status; null when it cannot be read. */
+async function readRunStatus(input: {
+  baseUrl: URL;
+  headers: Record<string, string>;
+  runId: string;
 }): Promise<Record<string, unknown> | null> {
   try {
-    const stopped = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/stop`), {
-      method: "POST",
-      headers: input.headers,
-    });
-    await input.ctx.onLog("stdout", `[hermes-gateway] stop requested for run ${input.runId}\n`);
-    return asRecord(stopped);
-  } catch (err) {
-    await input.ctx.onLog("stderr", `[hermes-gateway] stop request failed: ${redactErrorMessage(err, input.redactText)}\n`);
+    // Bounded read raced against its own timer: a stalled (non-abortable)
+    // fetch must never outlive the caller's settlement window.
+    const status = await Promise.race([
+      fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}`), {
+        method: "GET",
+        headers: input.headers,
+        signal: AbortSignal.timeout(FINAL_STATUS_READ_TIMEOUT_MS),
+      }),
+      new Promise((resolve) => setTimeout(() => resolve(undefined), FINAL_STATUS_READ_TIMEOUT_MS)),
+    ]);
+    if (status === undefined) return null;
+    return asRecord(status);
+  } catch {
     return null;
   }
 }
 
+
+/**
+ * Observes the run after a stop within a bounded window. Reads are bounded
+ * individually (timer races) so even a stalled non-abortable fetch cannot
+ * outlive the window. Fast path: a run that already reports terminal settles
+ * on the first read. While the reported status keeps CHANGING (Hermes winding
+ * the run down), keep polling; once it STALLS on the same non-terminal value,
+ * return that observation. Repeated UNREADABLE reads back off and stop after
+ * a few attempts — a dead gateway is not going to answer later in the window.
+ * Returns the last readable record, or null when nothing was ever readable.
+ */
 async function fetchFinalStatus(input: {
   baseUrl: URL;
   headers: Record<string, string>;
@@ -1493,21 +1925,43 @@ async function fetchFinalStatus(input: {
   deadlineMs: number;
 }): Promise<Record<string, unknown> | null> {
   const deadline = Date.now() + input.deadlineMs;
-  while (Date.now() < deadline) {
-    try {
-      const status = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}`), {
-        method: "GET",
-        headers: input.headers,
-      });
-      const record = asRecord(status);
-      const normalized = extractStatus(status);
-      if (normalized && TERMINAL_STATUSES.has(normalized)) return record;
-    } catch {
-      return null;
+  let lastRecord: Record<string, unknown> | null = null;
+  let previous: string | null = null;
+  let readFailures = 0;
+  for (;;) {
+    const budgetLeft = deadline - Date.now();
+    if (budgetLeft <= 0) return lastRecord;
+    // Each read gets at most its own slice of the observation window, so even
+    // a stalled (non-abortable) fetch cannot push this loop past the deadline.
+    const record = await Promise.race([
+      readRunStatus(input),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), budgetLeft)),
+    ]);
+    if (record === null) {
+      lastRecord = null;
+      readFailures += 1;
+      // Three unreadable reads in a row: the gateway is down for this window,
+      // stop early and report the remote state as unresolved.
+      if (readFailures >= 3) return null;
+      const rem = deadline - Date.now();
+      if (rem <= 0) return null;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(500, rem)));
+      continue;
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    readFailures = 0;
+    lastRecord = record;
+    const status = extractStatus(record);
+    if (status && TERMINAL_STATUSES.has(status)) return record;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return record;
+    if (status !== null && status === previous) {
+      // The status stopped changing without reaching terminal: further polling
+      // would burn the whole window for the same answer.
+      return record;
+    }
+    previous = status;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(500, remaining)));
   }
-  return null;
 }
 
 function redactErrorMessage(err: unknown, redactText: TextRedactor = sanitizeSensitiveText): string {
@@ -1642,6 +2096,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     sessionKey,
     runHeaders.Authorization,
     runHeaders["X-Hermes-Session-Key"],
+    // The Paperclip run JWT must never echo back in a card, log, or result
+    // either (R3), without ever being sent to the Hermes gateway.
+    ctx.authToken,
+    ctx.authToken ? `Bearer ${ctx.authToken}` : null,
   ]);
   const body = buildRunBody(ctx, sessionKey);
   const createRunUrl = apiUrl(baseUrl, "/v1/runs");
@@ -1696,6 +2154,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const state = createExecutionState(runId);
   const controller = new AbortController();
+  if (ctx.signal) {
+    // An operator cancel must cut through an approval wait too (R4): the same
+    // controller owns the streams and every awaited approval call.
+    const abortFromOperator = () => controller.abort();
+    if (ctx.signal.aborted) abortFromOperator();
+    else ctx.signal.addEventListener("abort", abortFromOperator, { once: true });
+  }
   void consumeEvents({
     ctx,
     baseUrl,
@@ -1723,9 +2188,54 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     timeoutTimer = setTimeout(() => resolve("timeout"), timeoutMs);
   });
 
-  const outcome = await Promise.race([state.terminalPromise, timeoutPromise]);
+  // Cancellation is a settlement path of its own: with `timeoutSec: 0` there is
+  // no local timeout either, so an operator stop that never reaches a Hermes
+  // terminal event would leave execute() (and the agent run) pending forever.
+  const cancelled = new Promise<"cancelled">((resolve) => {
+    if (controller.signal.aborted) resolve("cancelled");
+    else controller.signal.addEventListener("abort", () => resolve("cancelled"), { once: true });
+  });
+
+  const outcome = await Promise.race([state.terminalPromise, timeoutPromise, cancelled]);
   if (timeoutTimer) clearTimeout(timeoutTimer);
   controller.abort();
+  // A run that ended while a human approval was still open must not abandon that bridge:
+  // the abort above cuts its wait short, and this bounded drain lets the exact denial land
+  // before the adapter returns (§11 R5). An incomplete drain is reported, not hidden.
+  const approvalSettled = await drainApprovalTasks(state);
+  if (!approvalSettled) {
+    await ctx.onLog("stderr", `[${APPROVAL_MARKER} run=${runId} hermes_gateway_approval_unsettled]\n`);
+  }
+
+  if (outcome === "cancelled") {
+    // Stop the remote run and observe its terminal state within the same bounded
+    // window the timeout path uses; an unsettled run is reported as `unknown`
+    // rather than silently assumed stopped.
+    await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
+    const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+    const finalStatusValue = extractStatus(finalStatus);
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: APPROVAL_RUN_CANCELLED,
+      errorMessage: "The Hermes gateway run was cancelled.",
+      provider: "hermes_gateway",
+      resultJson: {
+        run_id: runId,
+        status: finalStatusValue ?? "unknown",
+        last_event: state.lastEventName,
+        cancelled: true,
+        approval_drained: approvalSettled,
+        final_status: redactForLog(finalStatus, [], 0, redactText),
+      },
+      sessionParams: {
+        hermesRunId: runId,
+        strategy,
+      },
+      sessionDisplayId: sessionKey ? redactText(sessionKey) : null,
+    };
+  }
 
   if (outcome === "timeout") {
     await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
